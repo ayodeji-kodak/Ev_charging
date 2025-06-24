@@ -1,0 +1,86 @@
+import numpy as np
+import cvxpy as cp
+import matplotlib.pyplot as plt
+
+
+def get_heating_allocation_percentage(ambient_temp_c):
+    """Determine heating power allocation percentage based on ambient temperature."""
+    if ambient_temp_c < -15:
+        return 0.3  # 30%
+    elif -15 <= ambient_temp_c < -5:
+        return 0.2  # 20%
+    elif -5 <= ambient_temp_c < 0:
+        return 0.1  # 10%
+    else:
+        return 0.0  # No heating needed
+
+
+def laxity_based_scheduler_with_heating(num_vehicles, timesteps, initial_soc, max_power,
+                                        terminal_soc, dept_times, total_power_capacity,
+                                        ambient_temp_c, max_heating_power=7.0, plot=False):
+    heating_percentage = get_heating_allocation_percentage(ambient_temp_c)
+    heating_power = min(heating_percentage * total_power_capacity, max_heating_power)
+    charging_power_capacity = total_power_capacity - heating_power
+
+    # Define CVXPY variables
+    x = cp.Variable((num_vehicles, timesteps+1))  # SOC
+    u = cp.Variable((num_vehicles, timesteps))    # Charging power
+    laxity = np.array([dept_times[i] - (terminal_soc[i] - initial_soc[i]) / max_power for i in range(num_vehicles)])
+
+    # Parameters
+    x0 = cp.Parameter(num_vehicles)
+    x0.value = initial_soc
+    x_terminal = cp.Parameter(num_vehicles)
+    x_terminal.value = terminal_soc
+
+    constraints = [x[:, 0] == x0, x[:, -1] >= x_terminal]
+    obj = 0
+
+    for t in range(timesteps):
+        constraints += [
+            x[:, t+1] == x[:, t] + u[:, t],
+            u[:, t] >= 0,
+            u[:, t] <= max_power,
+            cp.sum(u[:, t]) <= charging_power_capacity,
+            u[:, t] <= ((t * np.ones_like(dept_times)) < dept_times) * 100.0 + 0.000001
+        ]
+        urgency = 1.0 / (1.0 + laxity)
+        obj += cp.sum(cp.multiply(urgency, cp.log(u[:, t] + 1e-3)))
+
+    # Solve problem
+    prob = cp.Problem(cp.Maximize(obj), constraints)
+    prob.solve()
+
+    if plot:
+        plt.figure(figsize=(10, 5))
+        for i in range(num_vehicles):
+            plt.plot(x.value[i], label=f"SOC Vehicle {i+1}")
+            plt.plot(u.value[i], label=f"Power Vehicle {i+1}", linestyle='--')
+        plt.title("EV Charging with Heating Consideration")
+        plt.xlabel("Time")
+        plt.ylabel("Value")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    return x.value, u.value, heating_power
+
+
+# Example usage:
+if __name__ == '__main__':
+    n = 3  # number of vehicles
+    T = 24  # timesteps
+    init_soc = np.array([0.2, 0.5, 0.1])
+    max_power = 7.0  # kW per EV
+    terminal_soc = np.array([0.8, 0.9, 0.6])
+    dept_times = np.array([20, 22, 18])
+    total_capacity = 20.0  # kW
+    ambient_temp = -10  # Celsius
+
+    soc, power, heating = laxity_based_scheduler_with_heating(n, T, init_soc, max_power,
+                                                              terminal_soc, dept_times,
+                                                              total_capacity, ambient_temp,
+                                                              plot=True)
+
+    print("Final SOC:\n", soc[:, -1])
+    print("Total heating power used:", heating, "kW")
