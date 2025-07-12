@@ -3,43 +3,28 @@ from gymnasium import spaces
 import numpy as np
 
 class EVChargingEnv(gym.Env):
-    """
-    EV Charging Environment.
-
-    Observation space (state):
-        Tbatt: Battery temperature at arrival (°C)
-        tav: Time of arrival (hour in 24h format, 0–24)
-        tdep: Time of departure (hour in 24h format, 0–24)
-        SOC: State of Charge [0–1]
-        x_target: Target SOC [0–1]
-        P_available: Available charging power (kW)
-        trem: Remaining time to charge (hours) = (tdep - current_time), updated each step
-
-    Action space:
-        [charging_power (0–22 kW), heat_power (0–3 kW), cool_power (0–3 kW)]
-    """
-
     def __init__(self):
         super(EVChargingEnv, self).__init__()
 
-        self.max_charge_power = 22.0  # kW
-        self.max_heat_power = 3.0     # kW
-        self.max_cool_power = 3.0     # kW
-        self.mu = 0.95                # Charging efficiency
+        # Constants
+        self.max_charge_power = 22.0  # kW (max charging power)
+        self.max_heat_power = 3.0     # kW max heating
+        self.max_cool_power = 3.0     # kW max cooling
+        self.mu = 0.95                # charging efficiency
         self.battery_capacity_kWh = 60.0
-        self.nominal_voltage = 400.0
+        self.nominal_voltage = 400.0  # volts
         self.internal_resistance = 0.01  # Ohms
 
-        # Observation: [Tbatt, tav, tdep, SOC, x_target, P_available, trem]
+        # Observation space: Tbatt, tav, tdep, SOC, x_target, P_available, trem
         self.observation_space = spaces.Box(
             low=np.array([0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
             high=np.array([60, 24, 24, 1, 1, 30, 24], dtype=np.float32),
             dtype=np.float32
         )
 
-        # Action: [charge_power, heat_power, cool_power]
+        # Action space: charge_power, heat_power, cool_power
         self.action_space = spaces.Box(
-            low=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            low=np.array([0., 0., 0.], dtype=np.float32),
             high=np.array([self.max_charge_power, self.max_heat_power, self.max_cool_power], dtype=np.float32),
             dtype=np.float32
         )
@@ -54,31 +39,24 @@ class EVChargingEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.Tbatt = self.np_random.uniform(10, 40)
-        self.tav = self.np_random.uniform(0, 24)
-        self.tdep = self.tav + self.np_random.uniform(3, 8)  # Departure 3–8 hours after arrival
-        self.tdep = self.tdep % 24  # Wrap within 24h
+        self.Tbatt = self.np_random.uniform(10, 40)  # battery temp °C
+        self.tav = self.np_random.uniform(0, 24)     # arrival time hr
+        self.tdep = (self.tav + self.np_random.uniform(3, 8)) % 24  # departure time hr
         self.current_time = self.tav
 
-        self.x = self.np_random.uniform(0.2, 0.6)  # Initial SOC
+        self.x = self.np_random.uniform(0.2, 0.6)    # initial SOC
         self.x_target = self.np_random.uniform(0.8, 1.0)
         self.P_available = self.np_random.uniform(5, self.max_charge_power)
 
         self._update_trem()
         self._update_state()
 
-        self.history = {
-            "soc": [self.x],
-            "temp": [self.Tbatt],
-            "time": [self.current_time]
-        }
+        self.history = {"soc": [self.x], "temp": [self.Tbatt], "time": [self.current_time]}
 
         return self.state, {}
 
     def _update_trem(self):
-        """Update remaining time based on current time and tdep, considering wrap-around."""
-        delta = (self.tdep - self.current_time) % 24
-        self.trem = delta
+        self.trem = (self.tdep - self.current_time) % 24
 
     def _update_state(self):
         self.state = np.array([
@@ -87,57 +65,105 @@ class EVChargingEnv(gym.Env):
         ], dtype=np.float32)
 
     def step(self, action):
-        charge_power, heat_power, cool_power = action
-        charge_power = np.clip(charge_power, 0, self.max_charge_power)
-        heat_power = np.clip(heat_power, 0, self.max_heat_power)
-        cool_power = np.clip(cool_power, 0, self.max_cool_power)
+        # Clip actions
+        charge_power, heat_power, cool_power = np.clip(action, self.action_space.low, self.action_space.high)
 
+        # Prevent heating and cooling simultaneously
+        if heat_power > 0 and cool_power > 0:
+            # Prioritize heating if cold (<20), else cooling
+            if self.Tbatt < 20:
+                cool_power = 0
+            else:
+                heat_power = 0
+
+        # Prevent charging and cooling simultaneously if battery hot
+        if charge_power > 0 and cool_power > 0:
+            if self.Tbatt > 30:
+                charge_power = 0  # prioritize cooling to protect battery
+            else:
+                cool_power = 0   # prioritize charging
+
+        # If SOC reached target, stop charging
+        if self.x >= self.x_target:
+            charge_power = 0
+
+        # Force minimal charging or thermal power if no action and SOC < target
+        if charge_power == 0 and heat_power == 0 and cool_power == 0 and self.x < self.x_target:
+            min_charge = 0.1 * self.P_available
+            charge_power = min(min_charge, self.max_charge_power)
+
+        # Ensure total power does not exceed available
         total_power = charge_power + heat_power + cool_power
-
-        # Handle overdraw penalty
         if total_power > self.P_available:
             scale = self.P_available / total_power
             charge_power *= scale
             heat_power *= scale
             cool_power *= scale
-            overdraw_penalty = (total_power - self.P_available) * 5
+            overdraw_penalty = (total_power - self.P_available) * 10  # harsher penalty
         else:
             overdraw_penalty = 0
 
-        timestep_hr = 1 / 60  # 1-minute timestep
+        timestep_hr = 5 / 60  # 5 minute timestep
 
-        # CCCV tapering after 80% SOC
-        if self.x >= 0.8:
-            taper_factor = np.exp(-5 * (self.x - 0.8))
-            charge_power *= taper_factor
+        # CCCV Charging: constant current until 80% SOC, then exponential taper
+        if self.x < 0.8:
+            effective_charge_power = charge_power
+        else:
+            # Exponential tapering beyond 0.8 SOC (constant voltage)
+            taper_factor = np.exp(-10 * (self.x - 0.8))  # sharper taper
+            effective_charge_power = charge_power * taper_factor
 
-        delta_x = (charge_power * self.mu * timestep_hr) / self.battery_capacity_kWh
+        # Update SOC based on effective charging power
+        delta_x = (effective_charge_power * self.mu * timestep_hr) / self.battery_capacity_kWh
+        prev_soc = self.x
         self.x = np.clip(self.x + delta_x, 0, 1)
 
-        # Temperature update
-        current = (charge_power * 1000) / self.nominal_voltage if charge_power > 0 else 0
-        heat_from_charge = self.internal_resistance * current ** 2 / 1000  # kW
-
+        # Temperature dynamics
         ambient_temp = 25.0
         thermal_resistance = 0.1  # K/kW
         thermal_capacity = 10.0   # kWh/K
 
+        # Resistive heat from charging current
+        current = (effective_charge_power * 1000) / self.nominal_voltage if effective_charge_power > 0 else 0
+        heat_from_charge = (self.internal_resistance * current ** 2) / 1000  # kW heat
+
+        # Net heat power: heating minus cooling plus resistive heat
         net_heat_power = heat_power - cool_power + heat_from_charge
-        heat_loss = (self.Tbatt - ambient_temp) / thermal_resistance
-        dT = (net_heat_power - heat_loss) * timestep_hr / thermal_capacity
+
+        # Heat exchange with ambient using Newton's law of cooling
+        temp_diff = ambient_temp - self.Tbatt
+        heat_loss = temp_diff / thermal_resistance  # positive if ambient > Tbatt
+
+        total_heat_flow = net_heat_power + heat_loss
+        dT = (total_heat_flow * timestep_hr) / thermal_capacity
         self.Tbatt = np.clip(self.Tbatt + dT, 0, 60)
 
-        # Advance time
+        # Update time and remaining time
         self.current_time = (self.current_time + timestep_hr) % 24
         self._update_trem()
 
         done = self.trem <= 0 or self.x >= self.x_target
 
-        # Reward
-        soc_reward = -abs(self.x_target - self.x) * 10
-        temp_penalty = -5 if (self.Tbatt < 0 or self.Tbatt > 45) else -abs(25 - self.Tbatt) * 0.1
-        power_penalty = -total_power * 0.01
-        reward = soc_reward + temp_penalty + power_penalty - overdraw_penalty
+        # Reward components
+        soc_delta = self.x - prev_soc
+        soc_reward = soc_delta * 200  # emphasize SOC increase
+
+        # Temperature penalty: Quadratic penalty outside 20-30°C, reward within range
+        if 20 <= self.Tbatt <= 30:
+            temp_reward = 5.0  # positive reward for staying within target range
+            temp_penalty = 0
+        else:
+            temp_reward = 0
+            temp_penalty = -((self.Tbatt - 25) ** 2) * 0.5  # stronger penalty for temp deviation
+
+        # Encourage using power efficiently (charging + thermal)
+        power_used = charge_power + heat_power + cool_power
+        power_usage_penalty = -0.2 * (self.P_available - power_used) if self.x < self.x_target else 0
+
+        # Bonus for completion of SOC target on time
+        completion_bonus = 200 if self.x >= self.x_target and self.trem > 0 else 0
+
+        reward = soc_reward + temp_reward + temp_penalty + power_usage_penalty + completion_bonus - overdraw_penalty
 
         # Update state and history
         self._update_state()
@@ -148,7 +174,18 @@ class EVChargingEnv(gym.Env):
         info = {
             "soc": self.x,
             "tbatt": self.Tbatt,
-            "trem": self.trem
+            "trem": self.trem,
+            "charge_power": charge_power,
+            "heat_power": heat_power,
+            "cool_power": cool_power,
+            "reward_components": {
+                "soc_reward": soc_reward,
+                "temp_reward": temp_reward,
+                "temp_penalty": temp_penalty,
+                "power_usage_penalty": power_usage_penalty,
+                "completion_bonus": completion_bonus,
+                "overdraw_penalty": overdraw_penalty
+            }
         }
 
         return self.state, reward, done, False, info
