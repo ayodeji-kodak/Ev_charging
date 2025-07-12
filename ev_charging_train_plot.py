@@ -2,7 +2,6 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold
 from ev_charging import EVChargingEnv
@@ -18,6 +17,7 @@ STEP_HOURS = STEP_MINUTES / 60
 # === Helpers ===
 def make_env():
     def _init():
+        
         return EVChargingEnv()
     return _init
 
@@ -29,15 +29,15 @@ def make_vec_normalized_env():
 train_env = make_vec_normalized_env()
 eval_env = make_vec_normalized_env()
 
+
 # === Callbacks ===
-callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=-100, verbose=1)
 eval_callback = EvalCallback(
     eval_env,
-    callback_on_new_best=callback_on_best,
     eval_freq=5000,
     best_model_save_path="./logs/best_model/",
     verbose=1
 )
+
 
 # === Model Training or Loading ===
 policy_kwargs = dict(net_arch=[256, 256])
@@ -63,7 +63,7 @@ else:
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.0,
+        ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
         tensorboard_log="./ppo_ev_tensorboard/"
@@ -105,10 +105,9 @@ obs_values = raw_state.flatten()
 obs_labels = ["Tbatt", "tarrival", "tdeparture", "SOC", "x_target", "P_available", "trem"]
 obs_dict = dict(zip(obs_labels, obs_values))
 
-# === Consistent trem calculation ===
 tarrival = obs_dict["tarrival"]
 tdeparture = obs_dict["tdeparture"]
-initial_trem = (tdeparture - tarrival) % 24  # Wrap-around handling
+initial_trem = (tdeparture - tarrival) % 24
 trem = initial_trem
 
 # === Print Evaluation Info ===
@@ -140,40 +139,56 @@ while not done and step_count < max_steps:
         print(f"Time remaining reached zero at step {step_count}.")
         break
 
+    # === Predict Action ===
     action, _ = model.predict(state, deterministic=True)
+    action = np.array(action).flatten()
 
-    charge = np.clip(action[0][0], 0, max_charge_power)
-    heat = np.clip(action[0][1], 0, max_heat_power)
-    cool = np.clip(action[0][2], 0, max_cool_power)
+    raw_charge = action[0]
+    raw_heat = action[1]
+    raw_cool = action[2]
 
-    # Mutual exclusion of heat/cool
+    current_temp = eval_env.get_attr("Tbatt")[0]
+
+    charge = np.clip(raw_charge, 0, max_charge_power)
+    heat = np.clip(raw_heat, 0, max_heat_power)
+    cool = np.clip(raw_cool, 0, max_cool_power)
+
     if heat > cool:
         cool = 0.0
     else:
         heat = 0.0
 
-    clipped_action = np.array([charge, heat, cool], dtype=np.float32)
+    if current_temp < 22:
+        charge = 0.0
+        cool = 0.0
+    elif current_temp > 28:
+        charge = 0.0
+        heat = 0.0
 
-    result = eval_env.step([clipped_action])
+    total_requested_power = charge + heat + cool
+    if total_requested_power > P_available:
+        scale = P_available / total_requested_power
+        charge *= scale
+        heat *= scale
+        cool *= scale
 
-    if len(result) == 5:
-        next_state, reward, terminated, truncated, info = result
-        done = terminated[0] or truncated[0]
-        info = info[0]
-        reward = reward[0]
-    else:
-        next_state, reward, done_array, info = result
-        done = done_array[0]
-        info = info[0]
-        reward = reward[0]
+    clipped_action = np.array([[charge, heat, cool]], dtype=np.float32)
+
+    # Fixed unpacking here for gym < 0.26
+    next_state, reward, done, info = eval_env.step(clipped_action)
+
+    # Unpack from lists (VecEnv wraps outputs in lists/arrays)
+    done = done[0] if isinstance(done, (list, np.ndarray)) else done
+    reward = reward[0] if isinstance(reward, (list, np.ndarray)) else reward
+    info = info[0] if isinstance(info, (list, np.ndarray)) else info
 
     state = next_state
-    trem = max(0.0, trem - STEP_HOURS)
 
+    trem = max(0.0, trem - STEP_HOURS)
     soc = info.get("soc", np.nan)
     temp = info.get("tbatt", np.nan)
 
-    print(f"Step {step_count:03d} | SOC: {soc:.3f} | Temp: {temp:.2f} | trem: {trem:.3f} hrs | Reward: {reward:.3f} | Action: {clipped_action}")
+    print(f"Step {step_count:03d} | SOC: {soc:.3f} | Temp: {temp:.2f} | trem: {trem:.3f} hrs | Reward: {reward:.3f} | Action: [{charge:.2f}, {heat:.2f}, {cool:.2f}]")
 
     soc_history.append(soc)
     temp_history.append(temp)
@@ -182,7 +197,7 @@ while not done and step_count < max_steps:
 
     step_count += 1
 
-# === Results Summary ===
+# === Final Results ===
 final_soc = soc_history[-1]
 target_soc = base_env.x_target
 percent_error = 100 * abs(final_soc - target_soc) / target_soc
