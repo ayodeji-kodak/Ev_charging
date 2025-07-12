@@ -131,10 +131,10 @@ class EVChargingEnv(gym.Env):
         net_heat_power = heat_power - cool_power + heat_from_charge
 
         # Heat exchange with ambient using Newton's law of cooling
-        temp_diff = ambient_temp - self.Tbatt
-        heat_loss = temp_diff / thermal_resistance  # positive if ambient > Tbatt
+        temp_diff = self.Tbatt - ambient_temp
+        heat_loss = temp_diff / thermal_resistance
+        total_heat_flow = net_heat_power - heat_loss
 
-        total_heat_flow = net_heat_power + heat_loss
         dT = (total_heat_flow * timestep_hr) / thermal_capacity
         self.Tbatt = np.clip(self.Tbatt + dT, 0, 60)
 
