@@ -86,6 +86,19 @@ class EVChargingEnv(gym.Env):
         # If SOC reached target, stop charging
         if self.x >= self.x_target:
             charge_power = 0
+        else:
+            # Slow down charging if we're too early to reach full SOC
+            charging_buffer = 0.167  # 10 minutes
+            timestep_hr = 5 / 60
+            required_energy_kWh = max(0, (self.x_target - self.x) * self.battery_capacity_kWh)
+            estimated_time_hr = required_energy_kWh / (charge_power * self.mu) if charge_power > 0 else float('inf')
+
+            # If charging would finish too early, reduce charge power
+            if estimated_time_hr + charging_buffer < self.trem:
+                max_charge_duration = self.trem - charging_buffer
+                adjusted_power = required_energy_kWh / max_charge_duration / self.mu
+                charge_power = min(charge_power, adjusted_power, self.max_charge_power)
+
 
         # Force minimal charging or thermal power if no action and SOC < target
         if charge_power == 0 and heat_power == 0 and cool_power == 0 and self.x < self.x_target:
