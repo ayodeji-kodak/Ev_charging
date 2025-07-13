@@ -155,7 +155,7 @@ class EVChargingEnv(gym.Env):
         self.current_time = (self.current_time + timestep_hr) % 24
         self._update_trem()
 
-        done = self.trem <= 0 or self.x >= self.x_target
+        done = self.trem <= 0 
 
         # Reward components
         soc_delta = self.x - prev_soc
@@ -177,6 +177,13 @@ class EVChargingEnv(gym.Env):
         completion_bonus = 200 if self.x >= self.x_target and self.trem > 0 else 0
 
         reward = soc_reward + temp_reward + temp_penalty + power_usage_penalty + completion_bonus - overdraw_penalty
+
+        MIN_REMAINING_TIME = 0.1667  # hours
+
+        # Check if the target SOC is reached too early
+        if self.x >= self.x_target and self.trem > MIN_REMAINING_TIME:
+            early_finish_penalty = (self.trem - MIN_REMAINING_TIME) * 0.5
+            reward -= early_finish_penalty
 
         # Update state and history
         self._update_state()
