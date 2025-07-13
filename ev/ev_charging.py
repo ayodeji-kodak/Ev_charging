@@ -2,23 +2,18 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-STEP_HOURS = 5 / 60  # 5 minutes in hours
-
 class EVChargingEnv(gym.Env):
-    def __init__(self, debug=False):
+    def __init__(self):
         super(EVChargingEnv, self).__init__()
-
-        self.debug = debug  # Added debug flag
 
         # Constants
         self.max_charge_power = 22.0  # kW (max charging power)
         self.max_heat_power = 3.0     # kW max heating
         self.max_cool_power = 3.0     # kW max cooling
-        self.mu = 0.95                # charging efficiency (nominal)
+        self.mu = 0.95                # charging efficiency
         self.battery_capacity_kWh = 60.0
         self.nominal_voltage = 400.0  # volts
-        self.internal_resistance_25C = 0.01  # Ohms at 25°C
-        self.alpha = 0.0039  # Temperature coefficient of resistance (per °C)
+        self.internal_resistance = 0.01  # Ohms
 
         # Observation space: Tbatt, tav, tdep, SOC, x_target, P_available, trem
         self.observation_space = spaces.Box(
@@ -37,14 +32,6 @@ class EVChargingEnv(gym.Env):
         self.seed()
         self.reset()
 
-    def temp_dependent_resistance(self, T):
-        return self.internal_resistance_25C * (1 + self.alpha * (T - 25))
-    
-    def temp_dependent_efficiency(self, T):
-        nominal_eff = self.mu
-        efficiency = nominal_eff - 0.005 * (T - 25)**2
-        return np.clip(efficiency, 0.8, nominal_eff)
-
     def seed(self, seed=None):
         self.np_random, seed = gym.utils.seeding.np_random(seed)
         return [seed]
@@ -52,20 +39,17 @@ class EVChargingEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.Tbatt = self.np_random.uniform(10, 40)
-        self.tav = self.np_random.uniform(0, 24)
-        self.tdep = (self.tav + self.np_random.uniform(3, 8)) % 24
+        self.Tbatt = self.np_random.uniform(10, 40)  # battery temp °C
+        self.tav = self.np_random.uniform(0, 24)     # arrival time hr
+        self.tdep = (self.tav + self.np_random.uniform(3, 8)) % 24  # departure time hr
         self.current_time = self.tav
 
-        self.x = self.np_random.uniform(0.2, 0.6)
+        self.x = self.np_random.uniform(0.2, 0.6)    # initial SOC
         self.x_target = self.np_random.uniform(0.8, 1.0)
         self.P_available = self.np_random.uniform(5, self.max_charge_power)
 
         self._update_trem()
         self._update_state()
-
-        self.current_step = 0               # <-- Add step counter
-        self.max_steps = int(24 / STEP_HOURS)  # 24 hours / 5 min steps = 288
 
         self.history = {"soc": [self.x], "temp": [self.Tbatt], "time": [self.current_time]}
 
@@ -81,118 +65,127 @@ class EVChargingEnv(gym.Env):
         ], dtype=np.float32)
 
     def step(self, action):
+        # Clip actions
         charge_power, heat_power, cool_power = np.clip(action, self.action_space.low, self.action_space.high)
 
+        # Prevent heating and cooling simultaneously
         if heat_power > 0 and cool_power > 0:
-            if heat_power >= cool_power:
+            # Prioritize heating if cold (<20), else cooling
+            if self.Tbatt < 20:
                 cool_power = 0
             else:
                 heat_power = 0
 
+        # Prevent charging and cooling simultaneously if battery hot
+        if charge_power > 0 and cool_power > 0:
+            if self.Tbatt > 30:
+                charge_power = 0  # prioritize cooling to protect battery
+            else:
+                cool_power = 0   # prioritize charging
+
+        # If SOC reached target, stop charging
         if self.x >= self.x_target:
             charge_power = 0
         else:
-            charging_buffer = 0.167
-            timestep_hr = STEP_HOURS
+            # Slow down charging if we're too early to reach full SOC
+            charging_buffer = 0.167  # 10 minutes
+            timestep_hr = 5 / 60
             required_energy_kWh = max(0, (self.x_target - self.x) * self.battery_capacity_kWh)
             estimated_time_hr = required_energy_kWh / (charge_power * self.mu) if charge_power > 0 else float('inf')
 
+            # If charging would finish too early, reduce charge power
             if estimated_time_hr + charging_buffer < self.trem:
                 max_charge_duration = self.trem - charging_buffer
                 adjusted_power = required_energy_kWh / max_charge_duration / self.mu
                 charge_power = min(charge_power, adjusted_power, self.max_charge_power)
 
+
+        # Force minimal charging or thermal power if no action and SOC < target
+        if charge_power == 0 and heat_power == 0 and cool_power == 0 and self.x < self.x_target:
+            min_charge = 0.1 * self.P_available
+            charge_power = min(min_charge, self.max_charge_power)
+
+        # Ensure total power does not exceed available
         total_power = charge_power + heat_power + cool_power
         if total_power > self.P_available:
             scale = self.P_available / total_power
             charge_power *= scale
             heat_power *= scale
             cool_power *= scale
-            overdraw_penalty = (total_power - self.P_available) * 10
+            overdraw_penalty = (total_power - self.P_available) * 10  # harsher penalty
         else:
             overdraw_penalty = 0
 
-        timestep_hr = STEP_HOURS
+        timestep_hr = 5 / 60  # 5 minute timestep
 
-        self.current_time = (self.current_time + timestep_hr) % 24
-        self._update_trem()
-
-        self.current_step += 1
-        done = self.current_step >= self.max_steps  
-
-        internal_resistance = self.temp_dependent_resistance(self.Tbatt)
-
-        V_nominal = self.nominal_voltage
-        R_internal = internal_resistance
-        V_max = V_nominal + 20.0
-        V_ocv = V_nominal + (V_max - V_nominal) * self.x
-
+        # CCCV Charging: constant current until 80% SOC, then exponential taper
         if self.x < 0.8:
-            I = charge_power * 1000 / V_nominal
-            V_batt = V_ocv + I * R_internal
-            effective_charge_power = I * V_batt / 1000
+            effective_charge_power = charge_power
         else:
-            V_batt = V_max
-            I_cc = charge_power * 1000 / V_nominal
-            taper_factor = np.exp(-10 * (self.x - 0.8))
-            I = I_cc * taper_factor
-            effective_charge_power = I * V_batt / 1000
+            # Exponential tapering beyond 0.8 SOC (constant voltage)
+            taper_factor = np.exp(-10 * (self.x - 0.8))  # sharper taper
+            effective_charge_power = charge_power * taper_factor
 
-        temp_efficiency = self.temp_dependent_efficiency(self.Tbatt)
-
-        delta_x = (effective_charge_power * temp_efficiency * timestep_hr) / self.battery_capacity_kWh
+        # Update SOC based on effective charging power
+        delta_x = (effective_charge_power * self.mu * timestep_hr) / self.battery_capacity_kWh
         prev_soc = self.x
         self.x = np.clip(self.x + delta_x, 0, 1)
 
+        # Temperature dynamics
         ambient_temp = 25.0
-        thermal_resistance = 0.1
-        thermal_capacity = 10.0
+        thermal_resistance = 0.1  # K/kW
+        thermal_capacity = 10.0   # kWh/K
 
-        heat_from_charge = (R_internal * I ** 2) / 1000 if I > 0 else 0.0
+        # Resistive heat from charging current
+        current = (effective_charge_power * 1000) / self.nominal_voltage if effective_charge_power > 0 else 0
+        heat_from_charge = (self.internal_resistance * current ** 2) / 1000  # kW heat
 
+        # Net heat power: heating minus cooling plus resistive heat
         net_heat_power = heat_power - cool_power + heat_from_charge
 
+        # Heat exchange with ambient using Newton's law of cooling
         temp_diff = self.Tbatt - ambient_temp
         heat_loss = temp_diff / thermal_resistance
         total_heat_flow = net_heat_power - heat_loss
+
         dT = (total_heat_flow * timestep_hr) / thermal_capacity
         self.Tbatt = np.clip(self.Tbatt + dT, 0, 60)
 
+        # Update time and remaining time
+        self.current_time = (self.current_time + timestep_hr) % 24
+        self._update_trem()
+
+        done = self.trem <= 0 
+
+        # Reward components
         soc_delta = self.x - prev_soc
-        soc_reward = soc_delta * 200
+        soc_reward = soc_delta * 200  # emphasize SOC increase
 
-        zero_charge_penalty = 0
-        if charge_power == 0 and self.x < self.x_target:
-            zero_charge_penalty = -50
-
-        if self.Tbatt < 20:
-            temp_reward = 0
-            temp_penalty = -0.1 * (20 - self.Tbatt)
-        elif self.Tbatt <= 35:
-            temp_reward = 5.0
+        # Temperature penalty: Quadratic penalty outside 20-30°C, reward within range
+        if 20 <= self.Tbatt <= 30:
+            temp_reward = 5.0  # positive reward for staying within target range
             temp_penalty = 0
         else:
             temp_reward = 0
-            temp_penalty = -0.5 * (self.Tbatt - 35) ** 2
+            temp_penalty = -((self.Tbatt - 25) ** 2) * 0.5  # stronger penalty for temp deviation
 
-        thermal_action_reward = 0
-        if self.Tbatt < 20 and heat_power > 0:
-            thermal_action_reward = 2.0
-        elif self.Tbatt > 35 and cool_power > 0:
-            thermal_action_reward = 2.0
-
+        # Encourage using power efficiently (charging + thermal)
         power_used = charge_power + heat_power + cool_power
         power_usage_penalty = -0.2 * (self.P_available - power_used) if self.x < self.x_target else 0
+
+        # Bonus for completion of SOC target on time
         completion_bonus = 200 if self.x >= self.x_target and self.trem > 0 else 0
 
-        reward = (
-            soc_reward + temp_reward + temp_penalty +
-            thermal_action_reward + power_usage_penalty +
-            completion_bonus - overdraw_penalty +
-            zero_charge_penalty
-        )
-        reward = float(reward)
+        reward = soc_reward + temp_reward + temp_penalty + power_usage_penalty + completion_bonus - overdraw_penalty
 
+        MIN_REMAINING_TIME = 0.1667  # hours
+
+        # Check if the target SOC is reached too early
+        if self.x >= self.x_target and self.trem > MIN_REMAINING_TIME:
+            early_finish_penalty = (self.trem - MIN_REMAINING_TIME) * 0.5
+            reward -= early_finish_penalty
+
+        # Update state and history
         self._update_state()
         self.history["soc"].append(self.x)
         self.history["temp"].append(self.Tbatt)
@@ -214,12 +207,6 @@ class EVChargingEnv(gym.Env):
                 "overdraw_penalty": overdraw_penalty
             }
         }
-
-        # Conditional debug print
-        if self.debug:
-            print(f"Step {len(self.history['soc']) - 1:03d} | SOC: {self.x:.3f} | Temp: {self.Tbatt:.2f} | trem: {self.trem:.3f} hrs "
-                f"| Reward: {reward:.3f} | Action: [{charge_power:.2f}, {heat_power:.2f}, {cool_power:.2f}] "
-                f"| Heat from internal resistance: {heat_from_charge:.4f} kW | Estimated Temp Increase: {dT:.4f} °C")
 
         return self.state, reward, done, False, info
 
