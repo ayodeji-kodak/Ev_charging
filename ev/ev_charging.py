@@ -101,9 +101,9 @@ class EVChargingEnv(gym.Env):
 
 
         # Force minimal charging or thermal power if no action and SOC < target
-        if charge_power == 0 and heat_power == 0 and cool_power == 0 and self.x < self.x_target:
-            min_charge = 0.1 * self.P_available
-            charge_power = min(min_charge, self.max_charge_power)
+        #if charge_power == 0 and heat_power == 0 and cool_power == 0 and self.x < self.x_target:
+        #    min_charge = 0.1 * self.P_available
+        #    charge_power = min(min_charge, self.max_charge_power)
 
         # Ensure total power does not exceed available
         total_power = charge_power + heat_power + cool_power
