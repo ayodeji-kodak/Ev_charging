@@ -17,7 +17,7 @@ class EVChargingEnv(gym.Env):
 
         # Observation space: Tbatt, tav, tdep, SOC, x_target, P_available, trem
         self.observation_space = spaces.Box(
-            low=np.array([0, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+            low=np.array([-40, 0, 0, 0, 0, 0, 0], dtype=np.float32),
             high=np.array([60, 24, 24, 1, 1, 30, 24], dtype=np.float32),
             dtype=np.float32
         )
@@ -39,7 +39,7 @@ class EVChargingEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.Tbatt = self.np_random.uniform(10, 40)  # battery temp °C
+        self.Tbatt = self.np_random.uniform(-35, 55)  # battery temp °C
         self.tav = self.np_random.uniform(0, 24)     # arrival time hr
         self.tdep = (self.tav + self.np_random.uniform(3, 8)) % 24  # departure time hr
         self.current_time = self.tav
