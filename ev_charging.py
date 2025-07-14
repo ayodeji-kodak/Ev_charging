@@ -29,8 +29,13 @@ class EVChargingEnv(gym.Env):
             dtype=np.float32
         )
 
+        # Added: max episode steps
+        self.max_steps = 288  # 24 hours at 5-minute steps
+        self.current_step = 0
+
         self.seed()
         self.reset()
+
 
     def seed(self, seed=None):
         self.np_random, seed = gym.utils.seeding.np_random(seed)
@@ -51,12 +56,19 @@ class EVChargingEnv(gym.Env):
         self._update_trem()
         self._update_state()
 
+        # Reset step counter
+        self.current_step = 0
+
         self.history = {"soc": [self.x], "temp": [self.Tbatt], "time": [self.current_time]}
 
         return self.state, {}
 
     def _update_trem(self):
-        self.trem = (self.tdep - self.current_time) % 24
+        if self.tdep >= self.current_time:
+            self.trem = self.tdep - self.current_time
+        else:
+            self.trem = (24 - self.current_time) + self.tdep
+
 
     def _update_state(self):
         self.state = np.array([
@@ -156,7 +168,9 @@ class EVChargingEnv(gym.Env):
         self.current_time = (self.current_time + timestep_hr) % 24
         self._update_trem()
 
-        done = self.trem <= 0 
+
+
+        #done = self.trem <= 0 
 
         # Reward components
         soc_delta = self.x - prev_soc
@@ -208,6 +222,10 @@ class EVChargingEnv(gym.Env):
                 "overdraw_penalty": overdraw_penalty
             }
         }
+
+        self.current_step += 1
+
+        done = self.trem <= 0 or self.current_step >= self.max_steps
 
         return self.state, reward, done, False, info
 
