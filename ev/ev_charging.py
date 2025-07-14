@@ -146,7 +146,7 @@ class EVChargingEnv(gym.Env):
         # Temperature dynamics
         ambient_temp = 25.0
         thermal_resistance = 0.1  # K/kW
-        thermal_capacity = 50.0   # kWh/K
+        thermal_capacity = 10.0   # kWh/K
 
         # Resistive heat from charging current
         current = (effective_charge_power * 1000) / self.nominal_voltage if effective_charge_power > 0 else 0
@@ -182,8 +182,7 @@ class EVChargingEnv(gym.Env):
             temp_penalty = 0
         else:
             temp_reward = 0
-            temp_penalty = -0.1 * (abs(self.Tbatt - 25))  # linear penalty
-
+            temp_penalty = -((self.Tbatt - 25) ** 2) * 0.2  # stronger penalty for temp deviation
 
         # Encourage using power efficiently (charging + thermal)
         power_used = charge_power + heat_power + cool_power
@@ -228,6 +227,8 @@ class EVChargingEnv(gym.Env):
         }
 
         self.current_step += 1
+
+        reward = float(reward)
 
         done = self.trem <= 0 or self.current_step >= self.max_steps
 
