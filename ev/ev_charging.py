@@ -29,8 +29,13 @@ class EVChargingEnv(gym.Env):
             dtype=np.float32
         )
 
+        # Added: max episode steps
+        self.max_steps = 288  # 24 hours at 5-minute steps
+        self.current_step = 0
+
         self.seed()
         self.reset()
+
 
     def seed(self, seed=None):
         self.np_random, seed = gym.utils.seeding.np_random(seed)
@@ -51,12 +56,19 @@ class EVChargingEnv(gym.Env):
         self._update_trem()
         self._update_state()
 
+        # Reset step counter
+        self.current_step = 0
+
         self.history = {"soc": [self.x], "temp": [self.Tbatt], "time": [self.current_time]}
 
         return self.state, {}
 
     def _update_trem(self):
-        self.trem = (self.tdep - self.current_time) % 24
+        if self.tdep >= self.current_time:
+            self.trem = self.tdep - self.current_time
+        else:
+            self.trem = (24 - self.current_time) + self.tdep
+
 
     def _update_state(self):
         self.state = np.array([
@@ -134,7 +146,7 @@ class EVChargingEnv(gym.Env):
         # Temperature dynamics
         ambient_temp = 25.0
         thermal_resistance = 0.1  # K/kW
-        thermal_capacity = 10.0   # kWh/K
+        thermal_capacity = 50.0   # kWh/K
 
         # Resistive heat from charging current
         current = (effective_charge_power * 1000) / self.nominal_voltage if effective_charge_power > 0 else 0
@@ -145,7 +157,8 @@ class EVChargingEnv(gym.Env):
 
         # Heat exchange with ambient using Newton's law of cooling
         temp_diff = self.Tbatt - ambient_temp
-        heat_loss = temp_diff / thermal_resistance
+        #heat_loss = temp_diff / thermal_resistance
+        heat_loss = 0
         total_heat_flow = net_heat_power - heat_loss
 
         dT = (total_heat_flow * timestep_hr) / thermal_capacity
@@ -155,34 +168,39 @@ class EVChargingEnv(gym.Env):
         self.current_time = (self.current_time + timestep_hr) % 24
         self._update_trem()
 
-        done = self.trem <= 0 
+
+
+        #done = self.trem <= 0 
 
         # Reward components
         soc_delta = self.x - prev_soc
-        soc_reward = soc_delta * 200  # emphasize SOC increase
+        soc_reward = soc_delta * 50  # emphasize SOC increase
 
         # Temperature penalty: Quadratic penalty outside 20-30°C, reward within range
         if 20 <= self.Tbatt <= 30:
-            temp_reward = 5.0  # positive reward for staying within target range
+            temp_reward = 2.0  # positive reward for staying within target range
             temp_penalty = 0
         else:
             temp_reward = 0
-            temp_penalty = -((self.Tbatt - 25) ** 2) * 0.5  # stronger penalty for temp deviation
+            temp_penalty = -0.1 * (abs(self.Tbatt - 25))  # linear penalty
+
 
         # Encourage using power efficiently (charging + thermal)
         power_used = charge_power + heat_power + cool_power
-        power_usage_penalty = -0.2 * (self.P_available - power_used) if self.x < self.x_target else 0
+        power_usage_penalty = -0.05 * (self.P_available - power_used) if self.x < self.x_target else 0
 
         # Bonus for completion of SOC target on time
-        completion_bonus = 200 if self.x >= self.x_target and self.trem > 0 else 0
+        completion_bonus = 25 if self.x >= self.x_target and self.trem > 0 else 0
 
         reward = soc_reward + temp_reward + temp_penalty + power_usage_penalty + completion_bonus - overdraw_penalty
+
+        early_finish_penalty = 0
 
         MIN_REMAINING_TIME = 0.1667  # hours
 
         # Check if the target SOC is reached too early
         if self.x >= self.x_target and self.trem > MIN_REMAINING_TIME:
-            early_finish_penalty = (self.trem - MIN_REMAINING_TIME) * 0.5
+            early_finish_penalty = (self.trem - MIN_REMAINING_TIME) * 1
             reward -= early_finish_penalty
 
         # Update state and history
@@ -204,9 +222,14 @@ class EVChargingEnv(gym.Env):
                 "temp_penalty": temp_penalty,
                 "power_usage_penalty": power_usage_penalty,
                 "completion_bonus": completion_bonus,
+                "early_finish_penalty": early_finish_penalty if self.x >= self.x_target else 0,
                 "overdraw_penalty": overdraw_penalty
             }
         }
+
+        self.current_step += 1
+
+        done = self.trem <= 0 or self.current_step >= self.max_steps
 
         return self.state, reward, done, False, info
 
