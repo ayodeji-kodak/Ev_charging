@@ -174,30 +174,32 @@ class EVChargingEnv(gym.Env):
 
         # Reward components
         soc_delta = self.x - prev_soc
-        soc_reward = soc_delta * 200  # emphasize SOC increase
+        soc_reward = soc_delta * 50  # emphasize SOC increase
 
         # Temperature penalty: Quadratic penalty outside 20-30°C, reward within range
         if 20 <= self.Tbatt <= 30:
-            temp_reward = 5.0  # positive reward for staying within target range
+            temp_reward = 2.0  # positive reward for staying within target range
             temp_penalty = 0
         else:
             temp_reward = 0
-            temp_penalty = -((self.Tbatt - 25) ** 2) * 0.5  # stronger penalty for temp deviation
+            temp_penalty = -((self.Tbatt - 25) ** 2) * 0.2  # stronger penalty for temp deviation
 
         # Encourage using power efficiently (charging + thermal)
         power_used = charge_power + heat_power + cool_power
-        power_usage_penalty = -0.2 * (self.P_available - power_used) if self.x < self.x_target else 0
+        power_usage_penalty = -0.05 * (self.P_available - power_used) if self.x < self.x_target else 0
 
         # Bonus for completion of SOC target on time
-        completion_bonus = 200 if self.x >= self.x_target and self.trem > 0 else 0
+        completion_bonus = 25 if self.x >= self.x_target and self.trem > 0 else 0
 
         reward = soc_reward + temp_reward + temp_penalty + power_usage_penalty + completion_bonus - overdraw_penalty
+
+        early_finish_penalty = 0
 
         MIN_REMAINING_TIME = 0.1667  # hours
 
         # Check if the target SOC is reached too early
         if self.x >= self.x_target and self.trem > MIN_REMAINING_TIME:
-            early_finish_penalty = (self.trem - MIN_REMAINING_TIME) * 0.5
+            early_finish_penalty = (self.trem - MIN_REMAINING_TIME) * 1
             reward -= early_finish_penalty
 
         # Update state and history
@@ -219,6 +221,7 @@ class EVChargingEnv(gym.Env):
                 "temp_penalty": temp_penalty,
                 "power_usage_penalty": power_usage_penalty,
                 "completion_bonus": completion_bonus,
+                "early_finish_penalty": early_finish_penalty if self.x >= self.x_target else 0,
                 "overdraw_penalty": overdraw_penalty
             }
         }
