@@ -3,31 +3,31 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
+import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, CallbackList
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, CallbackList, StopTrainingOnRewardThreshold
+from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.evaluation import evaluate_policy
 
-from ev_charging import EVChargingEnv  # assumes your environment is defined in ev_charging.py
+from ev_charging import EVChargingEnv  # Update if the env is in a different file
 
-# === Configuration ===
+# === Config ===
 SEED = 42
-TOTAL_TIMESTEPS = 100_000
+TOTAL_TIMESTEPS = 200_000
 EVAL_FREQ = 5000
 STEP_MINUTES = 5
-STEP_HOURS = STEP_MINUTES / 60
-
-# === Paths ===
-MODEL_PATH = "ppo_ev_charging_model.zip"
+MODEL_PATH = "ppo_ev_final"
 NORM_PATH = "vec_normalize.pkl"
 CHECKPOINT_PATH = "./logs/checkpoints/"
 BEST_MODEL_PATH = "./logs/best_model/"
-TENSORBOARD_LOG = "./ppo_ev_tensorboard/"
+TENSORBOARD_LOG = "./tensorboard_logs/ppo_ev/"
 
 os.makedirs(CHECKPOINT_PATH, exist_ok=True)
 os.makedirs(BEST_MODEL_PATH, exist_ok=True)
 
-# === Environment Wrappers ===
+# === Environment Setup ===
 def make_env():
     def _init():
         env = EVChargingEnv()
@@ -36,12 +36,15 @@ def make_env():
 
 def make_vec_env(training=True):
     env = DummyVecEnv([make_env()])
-    vec_env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    vec_env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
     vec_env.training = training
     vec_env.norm_reward = training
     return vec_env
 
-# === Custom Eval Callback ===
+# Check if environment is valid
+check_env(EVChargingEnv(), warn=True)
+
+# === Custom Evaluation Callback with Reward Logging ===
 class RewardLoggingEvalCallback(EvalCallback):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -53,7 +56,7 @@ class RewardLoggingEvalCallback(EvalCallback):
             self.eval_rewards.append(self.last_mean_reward)
         return result
 
-# === Initialize Environments ===
+# === Create Environments ===
 train_env = make_vec_env(training=True)
 eval_env = make_vec_env(training=False)
 
@@ -62,7 +65,11 @@ eval_callback = RewardLoggingEvalCallback(
     eval_env=eval_env,
     eval_freq=EVAL_FREQ,
     best_model_save_path=BEST_MODEL_PATH,
-    verbose=1
+    log_path="./logs/ppo_ev",
+    deterministic=True,
+    render=False,
+    callback_on_new_best=StopTrainingOnRewardThreshold(reward_threshold=100.0, verbose=1),
+    verbose=1,
 )
 
 checkpoint_callback = CheckpointCallback(
@@ -79,57 +86,49 @@ policy_kwargs = dict(
     activation_fn=torch.nn.ReLU
 )
 
-# === Load or Initialize Model ===
-if os.path.exists(MODEL_PATH) and os.path.exists(NORM_PATH):
-    print("Loading saved model and normalization stats...")
-    train_env = VecNormalize.load(NORM_PATH, DummyVecEnv([make_env()]))
-    train_env.training = True
-    train_env.norm_reward = True
+# === Model Initialization ===
+print("Initializing PPO model...")
+model = PPO(
+    "MlpPolicy",
+    train_env,
+    seed=SEED,
+    verbose=1,
+    policy_kwargs=policy_kwargs,
+    learning_rate=lambda f: f * 1.5e-4,
+    n_steps=4096,
+    batch_size=128,
+    n_epochs=15,
+    gamma=0.98,
+    gae_lambda=0.95,
+    clip_range=0.1,
+    ent_coef=0.02,
+    vf_coef=2.0,
+    max_grad_norm=0.5,
+    tensorboard_log=TENSORBOARD_LOG,
+)
 
-    model = PPO.load(MODEL_PATH, env=train_env)
-
-    eval_env = VecNormalize.load(NORM_PATH, DummyVecEnv([make_env()]))
-    eval_env.training = False
-    eval_env.norm_reward = False
-    eval_env.reset()
-else:
-    print("Initializing new PPO model...")
-    model = PPO(
-        policy="MlpPolicy",
-        env=train_env,
-        seed=SEED,
-        verbose=1,
-        policy_kwargs=policy_kwargs,
-        n_steps=4096,
-        batch_size=128,
-        n_epochs=15,
-        gamma=0.98,
-        gae_lambda=0.95,
-        clip_range=0.1,
-        ent_coef=0.02,
-        vf_coef=2.0,
-        max_grad_norm=0.5,
-        tensorboard_log=TENSORBOARD_LOG,
-        learning_rate=lambda f: f * 1.5e-4,
-    )
-
-# === Train Model ===
-print(f"=== Starting training for {TOTAL_TIMESTEPS:,} timesteps ===")
+# === Training ===
+print(f"\n=== Training for {TOTAL_TIMESTEPS:,} timesteps ===")
 model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
 
-# === Save Model and Normalization ===
+# === Save final model and normalization stats ===
 model.save(MODEL_PATH)
 train_env.save(NORM_PATH)
-print("\nTraining complete. Model and normalization saved.")
+print("\nTraining complete. Model and VecNormalize stats saved.")
 
-# === Plot Rewards ===
+# === Evaluation ===
+mean_reward, std_reward = evaluate_policy(model, eval_env, n_eval_episodes=10)
+print(f"\nFinal Evaluation: mean_reward={mean_reward:.2f}, std_reward={std_reward:.2f}")
+
+# === Plot evaluation reward trend ===
 plt.figure(figsize=(10, 6))
 timesteps = np.arange(len(eval_callback.eval_rewards)) * EVAL_FREQ
-plt.plot(timesteps, eval_callback.eval_rewards, label="Eval Mean Reward")
+plt.plot(timesteps, eval_callback.eval_rewards, label="Evaluation Reward")
 plt.xlabel("Timesteps")
-plt.ylabel("Reward")
-plt.title("Evaluation Reward Progress")
+plt.ylabel("Mean Reward")
+plt.title("Evaluation Reward Over Time")
 plt.grid(True)
+plt.legend()
 plt.tight_layout()
 plt.savefig("eval_rewards.png")
 plt.show()
