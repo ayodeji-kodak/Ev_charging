@@ -1,8 +1,9 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from sustaingym.envs.evcharging import EVChargingEnv
-from sustaingym.envs.evcharging.event_generation import RealTraceGenerator
+from sustaingym.envs.evcharging.event_generation import RealTraceGenerator, GMMsTraceGenerator
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.monitor import Monitor
 import os
 import warnings
 
@@ -15,8 +16,8 @@ warnings.filterwarnings("ignore",
     message="Simulating \d+ events using Real trace generator",
     category=UserWarning)
 
-def load_env():
-    """Load and return the EV charging environment"""
+def create_env():
+    """Create and return the EV charging environment"""
     site = 'caltech'
     date_period = ('2019-05-01', '2019-08-31')
     moer_forecast_steps = 36
@@ -39,104 +40,46 @@ def load_env():
     )
     return env
 
-def plot_rewards(steps, rewards, max_rewards, profit_ratios):
-    """Plot the reward progression"""
-    plt.figure(figsize=(12, 6))
-    
-    # Reward comparison plot
-    plt.subplot(1, 2, 1)
-    plt.plot(steps, rewards, label='Achieved Reward', color='blue')
-    plt.plot(steps, max_rewards, label='Max Possible Reward', color='green', linestyle='--')
-    plt.xlabel('Step')
-    plt.ylabel('Reward')
-    plt.title('Reward Comparison')
-    plt.legend()
-    plt.grid(True)
-    
-    # Profit ratio plot
-    plt.subplot(1, 2, 2)
-    plt.plot(steps, profit_ratios, label='Profit Ratio', color='red')
-    plt.xlabel('Step')
-    plt.ylabel('Ratio')
-    plt.title('Achieved/Max Profit Ratio')
-    plt.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join('ppo_evcharging_logs', 'reward_analysis.png'))
-    plt.close()
-
-def evaluate_model():
-    """Evaluate the trained model"""
+def train_model():
+    """Train the PPO model and save it"""
     log_dir = "./ppo_evcharging_logs/"
-    model_path = os.path.join(log_dir, "ppo_evcharging_final.zip")
     os.makedirs(log_dir, exist_ok=True)
     
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found at {model_path}. Please train first.")
+    env = create_env()
+    env = Monitor(env, log_dir)
     
-    env = load_env()
-    model = PPO.load(model_path)
+    print("\nEnvironment created successfully!")
+    print(f"Number of stations: {env.num_stations}")
     
-    print("\n=== Running Evaluation ===")
-    obs, info = env.reset()
-    num_test_steps = 288
-    total_reward = 0
-    max_possible_profit = info['max_profit']
-
-    # Data storage for plotting
-    steps = []
-    rewards = []
-    max_rewards = []
-    profit_ratios = []
-    current_profits = []
-
-    print("\nInitial Session Info:")
-    print(f"- Max possible profit: ${max_possible_profit:.2f}")
-    print(f"- Reward breakdown keys: {list(info['reward_breakdown'].keys())}")
+    model = PPO(
+        "MultiInputPolicy",
+        env,
+        verbose=1,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        gamma=0.99,
+        gae_lambda=0.95,
+        ent_coef=0.01,
+        tensorboard_log=log_dir
+    )
     
-    for step in range(num_test_steps):
-        action, _states = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
-        
-        total_reward += reward
-        
-        # Store data for plotting
-        current_profit = info['reward_breakdown']['profit']
-        profit_ratio = current_profit / max_possible_profit
-        
-        steps.append(step)
-        rewards.append(total_reward)
-        max_rewards.append(max_possible_profit)
-        profit_ratios.append(profit_ratio)
-        current_profits.append(current_profit)
-        
-        active_evs = np.sum(obs['demands'] > 0)
-        if active_evs > 0 or step % 50 == 0:
-            print(f"\nStep {step + 1}:")
-            print(f"Active EVs: {active_evs}/{env.num_stations}")
-            print(f"Action stats: min={action.min():.3f}, max={action.max():.3f}")
-            print(f"Step reward: {reward:.2f} | Cumulative: {total_reward:.2f}")
-            print(f"Profit: ${current_profit:.2f} ({profit_ratio:.1%} of max)")
-            print(f"MOER: Current={obs['prev_moer'][0]:.4f}")
-        
-        if terminated:
-            print("\nEpisode terminated early!")
-            break
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000,
+        save_path=log_dir,
+        name_prefix="ppo_evcharging"
+    )
     
-    print("\n=== Final Results ===")
-    print(f"Total reward: {total_reward:.2f}")
-    if 'reward_breakdown' in info:
-        print("Final reward breakdown:")
-        for k, v in info['reward_breakdown'].items():
-            print(f"- {k}: {v:.2f}")
+    print("\nTraining PPO for 100,000 timesteps...")
+    model.learn(
+        total_timesteps=100000,
+        callback=checkpoint_callback,
+        tb_log_name="ppo_run"
+    )
     
-    # Generate plots
-    plot_rewards(steps, rewards, max_rewards, profit_ratios)
-    print("\nSaved reward analysis plots to ppo_evcharging_logs/reward_analysis.png")
-    
+    model.save(os.path.join(log_dir, "ppo_evcharging_final"))
+    print(f"\nModel saved to {log_dir}")
     env.close()
 
 if __name__ == "__main__":
-    evaluate_model()
+    train_model()
