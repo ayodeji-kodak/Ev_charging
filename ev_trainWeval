@@ -1,0 +1,171 @@
+import numpy as np
+from sustaingym.envs.evcharging import EVChargingEnv
+from sustaingym.envs.evcharging.event_generation import RealTraceGenerator, GMMsTraceGenerator
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.monitor import Monitor
+import os
+# to suppress minor violations
+import warnings
+warnings.filterwarnings("ignore", 
+    message="Invalid schedule provided at iteration",
+    category=UserWarning,
+    module="acnportal.*")
+
+warnings.filterwarnings("ignore", 
+    message="Simulating \d+ events using Real trace generator",
+    category=UserWarning)
+
+def main():
+    # Configuration parameters
+    site = 'caltech'  # or 'jpl'
+    date_period = ('2019-05-01', '2019-08-31')
+    moer_forecast_steps = 36
+    project_action_in_env = True
+    verbose = 2
+    
+    # RL training parameters
+    total_timesteps = 100_000
+    save_freq = 10_000
+    log_dir = "./ppo_evcharging_logs/"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    use_real_traces = True
+    
+    try:
+        # Create the appropriate trace generator
+        if use_real_traces:
+            print("Using RealTraceGenerator...")
+            data_generator = RealTraceGenerator(
+                site=site,
+                date_period=date_period,
+                sequential=True,
+                use_unclaimed=False,
+                requested_energy_cap=100,
+                seed=42
+            )
+        else:
+            print("Using GMMsTraceGenerator...")
+            data_generator = GMMsTraceGenerator(
+                site=site,
+                date_period=date_period,
+                n_components=30,
+                requested_energy_cap=100,
+                seed=42
+            )
+        
+        # Create and wrap environment
+        env = EVChargingEnv(
+            data_generator=data_generator,
+            moer_forecast_steps=moer_forecast_steps,
+            project_action_in_env=project_action_in_env,
+            verbose=verbose
+        )
+        env = Monitor(env, log_dir)  # For tracking metrics
+        
+        print("\nEnvironment created successfully!")
+        print(f"Number of stations: {env.num_stations}")
+        print(f"Action space: {env.action_space}")
+        print(f"Observation space: {env.observation_space}")
+        
+        # Initialize PPO
+        print("\nInitializing PPO model...")
+        model = PPO(
+            "MultiInputPolicy",
+            env,
+            verbose=1,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=64,
+            gamma=0.99,
+            gae_lambda=0.95,
+            ent_coef=0.01,
+            tensorboard_log=log_dir
+        )
+        print("PPO model initialized with configuration:")
+        print(f"- Learning rate: {model.learning_rate}")
+        print(f"- Batch size: {model.batch_size}")
+        print(f"- Gamma: {model.gamma}")
+        
+        # Setup checkpoint saving
+        checkpoint_callback = CheckpointCallback(
+            save_freq=save_freq,
+            save_path=log_dir,
+            name_prefix="ppo_evcharging"
+        )
+        
+        # Training phase
+        print(f"\nTraining PPO for {total_timesteps} timesteps...")
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=checkpoint_callback,
+            tb_log_name="ppo_run"
+        )
+        print("Training completed!")
+        
+        # Save the final model
+        model.save(os.path.join(log_dir, "ppo_evcharging_final"))
+        print(f"Model saved to {log_dir}")
+        
+        # Testing phase
+        print("\n=== Running Evaluation ===")
+        obs, info = env.reset()
+        num_test_steps = 288
+        total_reward = 0
+        max_possible_profit = info['max_profit']  # Direct access since key exists
+
+        print("\nInitial Session Info:")
+        print(f"- Max possible profit for episode: ${max_possible_profit:.2f}")
+        print(f"- Reward breakdown available: {list(info['reward_breakdown'].keys())}")
+        
+        print("\nEV Arrival Times:")
+        for ev in info.get('evs', []):
+            print(f"EV {ev.session_id}: arrives at {ev.arrival} periods")
+        
+        for step in range(num_test_steps):
+            action, _states = model.predict(obs, deterministic=True)
+            print(f"Policy output: Min={action.min():.3f}, Max={action.max():.3f}")  # Debug
+
+            obs, reward, terminated, truncated, info = env.step(action)
+            # Add this check:
+            if 'constraint_violation' in info and info['constraint_violation'] > 0:
+                print(f"⚠️ Projected violation: {info['constraint_violation']}")
+                
+            total_reward += reward
+            
+            active_evs = np.sum(obs['demands'] > 0)
+            if active_evs > 0 or step % 50 == 0:
+                print(f"\nStep {step + 1}:")
+                print(f"Active EVs: {active_evs}/{env.num_stations} (from observation)")
+                print(f"Action stats: min={action.min():.3f}, max={action.max():.3f}, mean={action.mean():.3f}")
+                
+                current_profit = info['reward_breakdown']['profit']
+                profit_ratio = current_profit / max_possible_profit
+                
+                print(f"Step reward: {reward:.2f} | Cumulative: {total_reward:.2f}")
+                print(f"Profit: ${current_profit:.2f} ({profit_ratio:.1%} of max)")
+                print(f"MOER: Current={obs['prev_moer'][0]:.4f}, Next 5={obs['forecasted_moer'][:5].round(4)}")
+                print("Full reward breakdown:")
+                for k, v in info['reward_breakdown'].items():
+                    print(f"- {k}: {v:.2f}")
+            
+            if terminated:
+                print("\nEpisode terminated early!")
+                break
+        
+        print("\n=== Final Evaluation Results ===")
+        print(f"Total reward: {total_reward:.2f}")
+        if 'reward_breakdown' in info:
+            print("Final reward breakdown:")
+            for k, v in info['reward_breakdown'].items():
+                print(f"- {k}: {v:.2f}")
+        
+    except Exception as e:
+        print(f"\nError occurred: {str(e)}")
+    finally:
+        if 'env' in locals():
+            env.close()
+            print("\nEnvironment closed successfully!")
+
+if __name__ == "__main__":
+    main()
