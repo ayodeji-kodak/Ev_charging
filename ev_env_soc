@@ -3,23 +3,40 @@ from gymnasium import spaces
 import numpy as np
 
 class EVChargingEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, num_evs=5):
         super().__init__()
+        self.num_evs = num_evs
 
-        # Max charging power (kW)
-        self.max_charge_power = 22.0
+        # Maximum available from grid
+        self.max_available_power = None  # kW
+        self.max_available_current = None  # amps
+        self.max_available_voltage = 240  # volts
 
-        # Observation space: [initial_state_of_charge (SOC), remaining_time (hours), target_soc]
-        self.observation_space = spaces.Box(low=np.array([0.0, 0.0, 0.0]), 
-                                            high=np.array([1.0, 24.0, 1.0]),
-                                            dtype=np.float32)
+        # Max charge power a station can deliver (kW)
+        self.max_charge_power = 11.5
 
-        # Action space: charge power between 0 and max_charge_power
-        self.action_space = spaces.Box(low=0.0, high=self.max_charge_power, shape=(1,), dtype=np.float32)
+        # Observation space for each EV: [initial_state_of_charge (SOC), remaining_time (hours), target_soc]
+        # Now we have num_evs observations
+        self.observation_space = spaces.Box(
+            low=np.array([0.0, 0.0, 0.0] * num_evs), 
+            high=np.array([1.0, 24.0, 1.0] * num_evs),
+            dtype=np.float32
+        )
+
+        # Action space: charge power between 0 and max_charge_power for each EV
+        self.action_space = spaces.Box(
+            low=0.0, 
+            high=self.max_charge_power, 
+            shape=(num_evs,),  # One action per EV
+            dtype=np.float32
+        )
 
         self.max_steps = 288  # 24 hours with 5 min steps
         self.current_step = 0
 
+        # Battery parameters for each EV (will be initialized in reset)
+        self.battery_params = []
+        
         self.seed()
         self.reset()
 
@@ -33,89 +50,166 @@ class EVChargingEnv(gym.Env):
         else:
             self.seed(np.random.randint(0, 10000))
 
-        self.soc = self.np_random.uniform(0.0, 0.2)         # Initial SOC between 0-20%
-        self.remaining_time = self.np_random.uniform(3.0, 8.0)  # Remaining time 3-8 hours
-        self.target_soc = self.np_random.uniform(0.7, 1.0)  #  target SOC 70% to 100%
+        # Initialize battery parameters for each EV
+        self.battery_params = []
+        for _ in range(self.num_evs):
+            params = {
+                'V_nominal': self.np_random.uniform(350.0, 450.0),  # Random nominal voltage
+                'R_internal': self.np_random.uniform(0.005, 0.02),  # Random internal resistance
+                'capacity': self.np_random.uniform(40.0, 80.0),     # Random capacity in kWh
+                'initial_soc': self.np_random.uniform(0.0, 0.2),    # Initial SOC
+                'remaining_time': self.np_random.uniform(3.0, 8.0), # Remaining time
+                'target_soc': self.np_random.uniform(0.7, 1.0)      # Target SOC
+            }
+            self.battery_params.append(params)
+
+        # Initialize state variables for each EV
+        self.socs = [params['initial_soc'] for params in self.battery_params]
+        self.remaining_times = [params['remaining_time'] for params in self.battery_params]
+        self.target_socs = [params['target_soc'] for params in self.battery_params]
+
+        # Randomize max station power (35-55 kW)
+        self.max_available_power = self.np_random.uniform(35.0, 55.0)
+        # Calculate max current to match power (I = P / V)
+        self.max_available_current = (self.max_available_power * 1000) / self.max_available_voltage
 
         self.current_step = 0
 
         return self._get_obs(), {}
 
     def _get_obs(self):
-        return np.array([self.soc, self.remaining_time, self.target_soc], dtype=np.float32)
+        # Flatten all EV states into a single observation vector
+        obs = []
+        for soc, time, target in zip(self.socs, self.remaining_times, self.target_socs):
+            obs.extend([soc, time, target])
+        return np.array(obs, dtype=np.float32)
 
-    def step(self, action):
-        charge_power = np.clip(action[0], 0, self.max_charge_power)  # kW
+    def step(self, actions):
+        # Clip actions to valid range
+        charge_powers = np.clip(actions, 0, self.max_charge_power)  # kW for each EV
+        
+        # Normalize powers if total exceeds available power
+        total_requested_power = np.sum(charge_powers)
+        if total_requested_power > self.max_available_power:
+            charge_powers = charge_powers * (self.max_available_power / total_requested_power)
+        
+        # Process each EV's charging
+        rewards = []
+        done_flags = []
+        infos = {
+            'actual_powers': [],
+            'currents': [],
+            'voltages': [],
+            'energy_added': []
+        }
+        
+        for i in range(self.num_evs):
+            charge_power = charge_powers[i]
+            params = self.battery_params[i]
+            
+            # Calculate charging current (A)
+            I_charge = charge_power * 1000 / params['V_nominal']  # convert kW to W, then volts to amps
 
-        # Constants for battery
-        V_nominal = 400.0  # volts
-        R_internal = 0.01  # ohms
-        battery_capacity_kWh = 60.0  # total capacity
+            # Voltage drop inside battery
+            V_drop = I_charge * params['R_internal']
 
-        # Calculate charging current (A)
-        I_charge = charge_power * 1000 / V_nominal  # convert kW to W, then volts to amps
+            # Actual battery terminal voltage
+            V_bat = params['V_nominal'] - V_drop
 
-        # Voltage drop inside battery
-        V_drop = I_charge * R_internal
+            # Power actually delivered to battery (W)
+            P_battery = V_bat * I_charge  # watts
 
-        # Actual battery terminal voltage
-        V_bat = V_nominal - V_drop
+            # Convert power to kW
+            P_battery_kw = P_battery / 1000
 
-        # Power actually delivered to battery (W)
-        P_battery = V_bat * I_charge  # watts
+            # Time step in hours (5 minutes)
+            delta_t = 5 / 60
 
-        # Convert power to kW
-        P_battery_kw = P_battery / 1000
+            # Energy added to battery in kWh
+            energy_added = P_battery_kw * delta_t
 
-        # Time step in hours (5 minutes)
-        delta_t = 5 / 60
+            # Update SOC (capped at 1.0)
+            self.socs[i] = min(self.socs[i] + energy_added / params['capacity'], 1.0)
 
-        # Energy added to battery in kWh
-        energy_added = P_battery_kw * delta_t
+            # Update remaining time
+            self.remaining_times[i] = max(self.remaining_times[i] - delta_t, 0.0)
 
-        # Update SOC (capped at 1.0)
-        self.soc = min(self.soc + energy_added / battery_capacity_kWh, 1.0)
-
-        # Update remaining time and step count as before
-        self.remaining_time = max(self.remaining_time - delta_t, 0.0)
+            # Calculate reward for this EV
+            reward = 1 - abs(self.target_socs[i] - self.socs[i])
+            rewards.append(reward)
+            
+            # Check if this EV is done
+            done_flags.append(self.remaining_times[i] <= 0)
+            
+            # Store info for this EV
+            infos['actual_powers'].append(P_battery_kw)
+            infos['currents'].append(I_charge)
+            infos['voltages'].append(V_bat)
+            infos['energy_added'].append(energy_added)
+        
+        # Update step count
         self.current_step += 1
-
-        # Reward 
-        reward = 1 - abs(self.target_soc - self.soc)
-        done = self.remaining_time <= 0 or self.current_step >= self.max_steps
-        info = {}
-
-        return self._get_obs(), reward, done, False, info
+        
+        # Calculate average reward across all EVs
+        avg_reward = np.mean(rewards)
+        
+        # Episode is done if all EVs are done or we've reached max steps
+        done = all(done_flags) or self.current_step >= self.max_steps
+        
+        return self._get_obs(), avg_reward, done, False, infos
 
     def render(self, mode='human'):
-        print(f"Step: {self.current_step}")
-        print(f"SOC: {self.soc:.3f}")
-        print(f"Target SOC: {self.target_soc:.2f}") 
-        print(f"Remaining Time: {self.remaining_time:.2f} hours")
-        print(f"Max Charge Power: {self.max_charge_power} kW")
+        print(f"\nStep: {self.current_step}")
+        print(f"Max Available Power(HUB): {self.max_available_power:.2f} kW")
+        print(f"Max Available Current(HUB): {self.max_available_current:.2f} A")
+        print(f"Voltage(HUB): {self.max_available_voltage} V")
+        print(f"Station Max Charge Power: {self.max_charge_power} kW")
+        print("-" * 40)
         
-        print("-" * 30)
+        for i in range(self.num_evs):
+            params = self.battery_params[i]
+            print(f"\nEV {i+1}:")
+            print(f"  Battery Capacity: {params['capacity']:.2f} kWh")
+            print(f"  Nominal Voltage: {params['V_nominal']:.2f} V")
+            print(f"  Internal Resistance: {params['R_internal']:.4f} ohms")
+            print(f"  Current SOC: {self.socs[i]:.3f}")
+            print(f"  Target SOC: {self.target_socs[i]:.3f}")
+            print(f"  Remaining Time: {self.remaining_times[i]:.2f} hours")
+            print("-" * 20)
 
     def close(self):
         pass
 
 
 if __name__ == "__main__":
-    env = EVChargingEnv()
+    env = EVChargingEnv(num_evs=5)
 
     obs, _ = env.reset()
     env.render()
     max_reward = 1.0  
 
     for _ in range(10):
-        # Random action between 0 and max charge power
-        action = env.action_space.sample()
-        print(f"Agent Action (Requested Charging Power): {action[0]:.2f} kW")
-        obs, reward, done, truncated, info = env.step(action)
+        # Random actions between 0 and max charge power for each EV
+        actions = env.action_space.sample()
+        total_requested_power = np.sum(actions)
+        percentage_used = (total_requested_power / env.max_available_power) * 100
+        print(f"\nAgent Actions (Requested Charging Powers): {[f'{a:.2f} kW' for a in actions]}")
+        print(f"Total Requested Power: {total_requested_power:.2f} kW")
+        print(f"Percentage of Available Power Used: {percentage_used:.2f}%")
+        
+        obs, reward, done, truncated, info = env.step(actions)
         env.render()
-        print(f"Reward at this step: {reward:.3f}")
-        print(f"Maximum possible reward: {max_reward:.3f}")
-        print("=" * 30)
+        print("\nCharging Results:")
+        for i in range(env.num_evs):
+            print(f"EV {i+1}:")
+            print(f"  Actual Power Delivered: {info['actual_powers'][i]:.2f} kW")
+            print(f"  Charging Current: {info['currents'][i]:.2f} A")
+            print(f"  Battery Terminal Voltage: {info['voltages'][i]:.2f} V")
+            print(f"  Energy Added: {info['energy_added'][i]:.4f} kWh")
+            print("-" * 20)
+        print(f"\nAverage Reward: {reward:.3f}")
+        print(f"Max Possible Reward: {max_reward:.3f}")
+        print("=" * 50)
         if done:
             print("Episode finished.")
             break
