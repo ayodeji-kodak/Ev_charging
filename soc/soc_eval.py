@@ -8,8 +8,53 @@ from sustaingym.envs.evcharging.event_generation import RealTraceGenerator
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 
+def get_theoretical_max_power():
+    """Return the absolute maximum power any charger can provide (6.656 kW)"""
+    return EVChargingEnv.ACTION_SCALE_FACTOR * EVChargingEnv.VOLTAGE / 1000
+
+def get_total_available_power(cn):
+    """
+    Calculate the total available power from the grid considering all constraints.
+    Returns total power in kW.
+    """
+    phase_factor = np.exp(1j * np.deg2rad(cn._phase_angles))
+    A_tilde = cn.constraint_matrix * phase_factor[None, :]
+    
+    # We need to find the maximum total current where all constraints are satisfied
+    # This is equivalent to solving a linear programming problem
+    
+    # Using cvxpy to match how the environment does it
+    import cvxpy as cp
+    
+    # Variables representing the current at each station (normalized 0-1)
+    action = cp.Variable(len(cn._phase_angles))
+    
+    # Objective is to maximize total current
+    objective = cp.Maximize(cp.sum(action))
+    
+    # Constraints
+    constraints = [
+        action >= 0,
+        action <= 1,
+        cp.abs(A_tilde @ action) * EVChargingEnv.ACTION_SCALE_FACTOR <= cn.magnitudes
+    ]
+    
+    # Solve the problem
+    prob = cp.Problem(objective, constraints)
+    prob.solve()
+    
+    if prob.status != 'optimal':
+        raise ValueError("Could not find optimal solution for total available power")
+    
+    # Convert total current to total power (kW)
+    # The solved action is normalized, so we need to scale it
+    total_current = np.sum(action.value) * EVChargingEnv.ACTION_SCALE_FACTOR
+    total_power = total_current * EVChargingEnv.VOLTAGE / 1000
+    
+    return total_power
+
 # === Load the trained model ===
-model_path = "./soc_evcharging_logs/soc_evcharging_final.zip"  # adjust if different
+model_path = "./soc_evcharging_logs/soc_evcharging_final.zip"
 model = PPO.load(model_path)
 print(f"\n✅ Loaded trained model from: {model_path}")
 
@@ -38,27 +83,38 @@ print("\n=== Environment Reset ===\n")
 
 # === Run the evaluation ===
 for timestep in range(288):
+    # Calculate power values
+    charger_max = get_theoretical_max_power()
+    total_available = get_total_available_power(env.cn)
+    
     # Predict action using the trained model
     action, _ = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = env.step(action)
 
-    # Calculate total energy delivered
-    total_energy_delivered = np.sum(action)
+    # Calculate delivered power
+    power_delivered_per_charger = action * charger_max  # action is [0-1], charger_max is 6.656kW
+    total_power_delivered = np.sum(power_delivered_per_charger)
     
-    # Print energy delivered information
+    # Print power delivered information
     if 'demands' in obs and np.any(obs['demands'] > 0):
         print(f"\n\n=== TIMESTEP {timestep} WITH DEMAND {'='*40}")
         
-        # Print total energy delivered
-        print(f"\n--- TOTAL ENERGY DELIVERED ---")
-        print(f"Total energy delivered this timestep: {total_energy_delivered:.4f} kWh")
+        # Print power information
+        print(f"\n--- POWER INFORMATION ---")
+        print(f"Maximum per charger: {charger_max:.3f} kW")
+        print(f"Total available from grid: {total_available:.3f} kW")
+        print(f"Total power delivered: {total_power_delivered:.3f} kW")
+        print(f"Grid utilization: {total_power_delivered/total_available:.1%}")
         
-        # Print action (energy delivered) for each station
-        print("\n--- ENERGY DELIVERED PER STATION ---")
-        for station_idx, energy in enumerate(action):
-            if obs['demands'][station_idx] > 0:  # Only print for stations with demand
-                print(f"Station {station_idx}: {energy:.4f} kWh delivered")
+        print("\n--- POWER USAGE PER CHARGER ---")
+        for station_idx, power in enumerate(power_delivered_per_charger):
+            if obs['demands'][station_idx] > 0:
+                print(f"Station {station_idx}: {power:.3f} kW")
         
+        print(f"\n--- TOTAL POWER DELIVERED ---")
+        print(f"Total power this timestep: {total_power_delivered:.3f} kW")
+        
+        # Rest of your print statements remain unchanged...
         print("\n--- DEMAND INFORMATION ---")
         demand_stations = np.where(obs['demands'] > 0)[0]
         num_demands = len(demand_stations)
