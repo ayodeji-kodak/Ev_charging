@@ -42,9 +42,22 @@ for timestep in range(288):
     action, _ = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = env.step(action)
 
-    # Only print if there's non-zero demand
+    # Calculate total energy delivered
+    total_energy_delivered = np.sum(action)
+    
+    # Print energy delivered information
     if 'demands' in obs and np.any(obs['demands'] > 0):
         print(f"\n\n=== TIMESTEP {timestep} WITH DEMAND {'='*40}")
+        
+        # Print total energy delivered
+        print(f"\n--- TOTAL ENERGY DELIVERED ---")
+        print(f"Total energy delivered this timestep: {total_energy_delivered:.4f} kWh")
+        
+        # Print action (energy delivered) for each station
+        print("\n--- ENERGY DELIVERED PER STATION ---")
+        for station_idx, energy in enumerate(action):
+            if obs['demands'][station_idx] > 0:  # Only print for stations with demand
+                print(f"Station {station_idx}: {energy:.4f} kWh delivered")
         
         print("\n--- DEMAND INFORMATION ---")
         demand_stations = np.where(obs['demands'] > 0)[0]
