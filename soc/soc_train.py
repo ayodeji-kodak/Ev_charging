@@ -240,7 +240,7 @@ def train_model():
         "MultiInputPolicy",
         env,
         verbose=1,
-        learning_rate=3e-4,
+        learning_rate=2e-4,
         n_steps=2048,
         batch_size=64,
         gamma=0.99,
@@ -249,9 +249,9 @@ def train_model():
         tensorboard_log=log_dir
     )
     
-    print("\nTraining PPO for 250,000 timesteps...")
+    print("\nTraining PPO for 100,000 timesteps...")
     model.learn(
-        total_timesteps=250000,
+        total_timesteps=100000,
         callback=plotting_callback,
         tb_log_name="ppo_run"
     )
