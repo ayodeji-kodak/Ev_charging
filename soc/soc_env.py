@@ -110,7 +110,7 @@ class EVChargingEnv(Env):
     MARGINAL_PROFIT_PER_KWH = MARGINAL_REVENUE_PER_KWH * OPERATING_MARGIN  # $ / kWh
     CO2_COST_PER_METRIC_TON = 30.85  # carbon cost in $ / 1000 kg CO2
     A_MINS_TO_KWH = (1 / 60) * (VOLTAGE / 1000)  # (kWh / A * mins)
-    VIOLATION_WEIGHT = 0.001  # cost in $ / kWh of violation
+    VIOLATION_WEIGHT = 0.8  # cost in $ / kWh of violation
 
     A_PERS_TO_KWH = A_MINS_TO_KWH * TIMESTEP_DURATION  # (kWh / A * periods)
     PROFIT_FACTOR = A_PERS_TO_KWH * MARGINAL_PROFIT_PER_KWH  # $ / (A * period)
