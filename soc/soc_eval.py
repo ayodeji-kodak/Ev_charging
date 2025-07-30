@@ -103,23 +103,42 @@ for timestep in range(288):
         print(f"Maximum possible per charger per timestep: {charger_max:.3f} kWh")
         print(f"Total available from grid per timestep: {total_available:.3f} kWh")
         
-        # Print detailed energy allocation per charger
-        print("\n--- ENERGY ALLOCATION PER CHARGER (kWh) ---")
-        print(f"\n{'='*40}")
+        # Print detailed energy allocation per charger with SOC information
+        print("\n--- CHARGER STATUS TABLE ---")
         demand_stations = np.where(obs['demands'] > 0)[0]
         
-        # Create a table of energy allocation
-        print(f"{'Station':<10}{'Action':<10}{'Energy':<10}{'Remaining':<12}{'Demand':<10}")
-        print("-" * 52)
+        # Create header for the table
+        header = [
+            "Station", "Action", "Energy (kWh)", "Remaining (kWh)", 
+            "Demand (kWh)", "Est Depart", "Arrival SOC", 
+            "Current SOC", "Target SOC"
+        ]
+        
+        # Format the header
+        print(
+            f"{header[0]:<8} {header[1]:<7} {header[2]:<12} {header[3]:<12} "
+            f"{header[4]:<12} {header[5]:<10} {header[6]:<12} "
+            f"{header[7]:<12} {header[8]:<12}"
+        )
+        print("-" * 100)
+        
+        # Populate the table rows
         for station_idx in demand_stations:
             energy = energy_delivered_per_charger[station_idx]
             remaining = obs['demands'][station_idx] - energy
+            est_depart = obs['est_departures'][station_idx]
+            
+            
             print(
-                f"{station_idx:<10}"
-                f"{action[station_idx]:<10.3f}"
-                f"{energy:<10.3f}"
-                f"{remaining:<12.3f}"
-                f"{obs['demands'][station_idx]:<10.3f}"
+                f"{station_idx:<8} "
+                f"{action[station_idx]:<7.3f} "
+                f"{energy:<12.3f} "
+                f"{remaining:<12.3f} "
+                f"{obs['demands'][station_idx]:<12.3f} "
+                f"{obs['est_departures'][station_idx]:<10}"
+                f"{obs['arrival_soc'][station_idx]:<12.1%} "
+                f"{obs['current_soc'][station_idx]:<12.1%} "
+                f"{obs['target_soc'][station_idx]:<12.1%}"
             )
         
         # Calculate and print utilization statistics
@@ -129,33 +148,7 @@ for timestep in range(288):
         print(f"Grid utilization: {total_allocated/total_available:.1%}")
         print(f"Average charger utilization: {avg_utilization:.1%}")
         
-        # Rest of your diagnostic print statements...
-        print("\n--- DEMAND INFORMATION (kWh) ---")
-        print(f"Number of stations with demand: {len(demand_stations)}")
-        print(f"Stations with demand: {demand_stations}")
-
-        print("\n--- NON-ZERO VALUES ONLY ---")
-        arrays_to_check = ['est_departures', 'demands', 'arrival_soc', 'target_soc', 'current_soc']
-        for array_name in arrays_to_check:
-            if array_name in obs:
-                array = obs[array_name]
-                non_zero_indices = np.where(array != 0)[0] if array_name != 'est_departures' else np.where(array != -288)[0]
-                if len(non_zero_indices) > 0:
-                    print(f"\n{array_name}:")
-                    for idx in non_zero_indices:
-                        print(f"  Station {idx}: {array[idx]}" + (" kWh" if array_name == 'demands' else ""))
-
-        if "active_evs" in info and info["active_evs"]:
-            print("\n--- DETAILED ACTIVE EV INFO ---")
-            for i, ev in enumerate(info["active_evs"]):
-                if ev.station_id in [env.cn.station_ids[i] for i in demand_stations]:
-                    print(f"\nEV at Station {ev.station_id}:")
-                    print(f"  Requested energy: {ev.requested_energy:.3f} kWh")
-                    print(f"  Delivered energy: {ev.delivered_energy:.3f} kWh")
-                    print(f"  Arrival SOC: {ev.arrival_soc:.1%}")
-                    print(f"  Current SOC: {ev.current_soc:.1%}")
-                    print(f"  Target SOC: {ev.target_soc:.1%}")
-
+        # Print reward information
         print(f"\nREWARD: {reward}")
     
     if terminated:
