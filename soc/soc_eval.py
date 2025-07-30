@@ -8,20 +8,17 @@ from sustaingym.envs.evcharging.event_generation import RealTraceGenerator
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 
-def get_theoretical_max_power():
-    """Return the absolute maximum power any charger can provide (6.656 kW)"""
-    return EVChargingEnv.ACTION_SCALE_FACTOR * EVChargingEnv.VOLTAGE / 1000
+def get_theoretical_max_energy(timestep_minutes=5):
+    """Return the absolute maximum energy any charger can provide in kWh for one timestep"""
+    return (EVChargingEnv.ACTION_SCALE_FACTOR * EVChargingEnv.VOLTAGE / 1000) * (timestep_minutes / 60)
 
-def get_total_available_power(cn):
+def get_total_available_energy(cn, timestep_minutes=5):
     """
-    Calculate the total available power from the grid considering all constraints.
-    Returns total power in kW.
+    Calculate the total available energy from the grid considering all constraints.
+    Returns total energy in kWh for one timestep.
     """
     phase_factor = np.exp(1j * np.deg2rad(cn._phase_angles))
     A_tilde = cn.constraint_matrix * phase_factor[None, :]
-    
-    # We need to find the maximum total current where all constraints are satisfied
-    # This is equivalent to solving a linear programming problem
     
     # Using cvxpy to match how the environment does it
     import cvxpy as cp
@@ -46,12 +43,12 @@ def get_total_available_power(cn):
     if prob.status != 'optimal':
         raise ValueError("Could not find optimal solution for total available power")
     
-    # Convert total current to total power (kW)
-    # The solved action is normalized, so we need to scale it
+    # Convert total current to total energy (kWh)
     total_current = np.sum(action.value) * EVChargingEnv.ACTION_SCALE_FACTOR
-    total_power = total_current * EVChargingEnv.VOLTAGE / 1000
+    total_power = total_current * EVChargingEnv.VOLTAGE / 1000  # kW
+    total_energy = total_power * (timestep_minutes / 60)  # kWh
     
-    return total_power
+    return total_energy
 
 # === Load the trained model ===
 model_path = "./soc_evcharging_logs/soc_evcharging_final.zip"
@@ -81,46 +78,61 @@ check_env(env, warn=True)
 obs, info = env.reset()
 print("\n=== Environment Reset ===\n")
 
+# Assuming 5-minute timesteps (as is common in EV charging simulations)
+timestep_minutes = 5
+
 # === Run the evaluation ===
 for timestep in range(288):
-    # Calculate power values
-    charger_max = get_theoretical_max_power()
-    total_available = get_total_available_power(env.cn)
+    # Calculate energy values (kWh per timestep)
+    charger_max = get_theoretical_max_energy(timestep_minutes)
+    total_available = get_total_available_energy(env.cn, timestep_minutes)
     
     # Predict action using the trained model
     action, _ = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = env.step(action)
 
-    # Calculate delivered power
-    power_delivered_per_charger = action * charger_max  # action is [0-1], charger_max is 6.656kW
-    total_power_delivered = np.sum(power_delivered_per_charger)
+    # Calculate delivered energy (kWh) per charger
+    energy_delivered_per_charger = action * charger_max  # action is [0-1], charger_max is in kWh
     
-    # Print power delivered information
+    # Print energy delivered information
     if 'demands' in obs and np.any(obs['demands'] > 0):
         print(f"\n\n=== TIMESTEP {timestep} WITH DEMAND {'='*40}")
         
-        # Print power information
-        print(f"\n--- POWER INFORMATION ---")
-        print(f"Maximum per charger: {charger_max:.3f} kW")
-        print(f"Total available from grid: {total_available:.3f} kW")
-        print(f"Total power delivered: {total_power_delivered:.3f} kW")
-        print(f"Grid utilization: {total_power_delivered/total_available:.1%}")
+        # Print energy information
+        print(f"\n--- ENERGY INFORMATION (kWh) ---")
+        print(f"Maximum possible per charger per timestep: {charger_max:.3f} kWh")
+        print(f"Total available from grid per timestep: {total_available:.3f} kWh")
         
-        print("\n--- POWER USAGE PER CHARGER ---")
-        for station_idx, power in enumerate(power_delivered_per_charger):
-            if obs['demands'][station_idx] > 0:
-                print(f"Station {station_idx}: {power:.3f} kW")
-        
-        print(f"\n--- TOTAL POWER DELIVERED ---")
-        print(f"Total power this timestep: {total_power_delivered:.3f} kW")
-        
-        # Rest of your print statements remain unchanged...
-        print("\n--- DEMAND INFORMATION ---")
+        # Print detailed energy allocation per charger
+        print("\n--- ENERGY ALLOCATION PER CHARGER (kWh) ---")
+        print(f"\n{'='*40}")
         demand_stations = np.where(obs['demands'] > 0)[0]
-        num_demands = len(demand_stations)
-        print(f"Number of stations with demand: {num_demands}")
+        
+        # Create a table of energy allocation
+        print(f"{'Station':<10}{'Action':<10}{'Energy':<10}{'Remaining':<12}{'Demand':<10}")
+        print("-" * 52)
+        for station_idx in demand_stations:
+            energy = energy_delivered_per_charger[station_idx]
+            remaining = obs['demands'][station_idx] - energy
+            print(
+                f"{station_idx:<10}"
+                f"{action[station_idx]:<10.3f}"
+                f"{energy:<10.3f}"
+                f"{remaining:<12.3f}"
+                f"{obs['demands'][station_idx]:<10.3f}"
+            )
+        
+        # Calculate and print utilization statistics
+        total_allocated = np.sum(energy_delivered_per_charger[demand_stations])
+        avg_utilization = np.mean(energy_delivered_per_charger[demand_stations] / charger_max)
+        print(f"\nTotal allocated to EVs: {total_allocated:.3f} kWh")
+        print(f"Grid utilization: {total_allocated/total_available:.1%}")
+        print(f"Average charger utilization: {avg_utilization:.1%}")
+        
+        # Rest of your diagnostic print statements...
+        print("\n--- DEMAND INFORMATION (kWh) ---")
+        print(f"Number of stations with demand: {len(demand_stations)}")
         print(f"Stations with demand: {demand_stations}")
-        print(f"Demand values: {obs['demands'][demand_stations]}")
 
         print("\n--- NON-ZERO VALUES ONLY ---")
         arrays_to_check = ['est_departures', 'demands', 'arrival_soc', 'target_soc', 'current_soc']
@@ -131,59 +143,20 @@ for timestep in range(288):
                 if len(non_zero_indices) > 0:
                     print(f"\n{array_name}:")
                     for idx in non_zero_indices:
-                        print(f"  Station {idx}: {array[idx]}")
-                else:
-                    print(f"\n{array_name}: All values are zero")
-
-        print("\n--- FULL OBSERVATION ---")
-        for key, value in obs.items():
-            print(f"\n{key}:")
-            print(f"Shape: {np.shape(value)}")
-            print(f"Dtype: {np.array(value).dtype}")
-            print(f"Number of elements: {len(value)}")
-            print("Values:")
-            pprint(value)
-
-        print("\n--- COMPLETE INFO DICTIONARY ---")
-        for key, value in info.items():
-            print(f"\n{key}:")
-            if isinstance(value, list):
-                print(f"Type: list (length {len(value)})")
-                print("All items:")
-                for i, item in enumerate(value):
-                    if hasattr(item, '__dict__'):
-                        print(f"[{i}]:")
-                        pprint(vars(item))
-                    else:
-                        print(f"[{i}]: {item}")
-            elif isinstance(value, dict):
-                print("Type: dict")
-                print(f"Number of items: {len(value)}")
-                print("All items:")
-                pprint(value)
-            else:
-                print(f"Value: {value}")
+                        print(f"  Station {idx}: {array[idx]}" + (" kWh" if array_name == 'demands' else ""))
 
         if "active_evs" in info and info["active_evs"]:
             print("\n--- DETAILED ACTIVE EV INFO ---")
-            print(f"Number of active EVs: {len(info['active_evs'])}")
             for i, ev in enumerate(info["active_evs"]):
                 if ev.station_id in [env.cn.station_ids[i] for i in demand_stations]:
-                    print(f"\nEV {i+1} FULL DETAILS:")
-                    ev_dict = vars(ev)
-                    print(f"Number of attributes: {len(ev_dict)}")
-                    for attr, val in ev_dict.items():
-                        print(f"{attr:>20}: {val}")
-
-        if hasattr(env, 'moer') and env.moer is not None:
-            print("\n--- COMPLETE MOER DATA ---")
-            print(f"Shape: {env.moer.shape}")
-            print(f"Number of values: {env.moer.size}")
-            print("Current timestep MOER values:")
-            pprint(env.moer[timestep])
+                    print(f"\nEV at Station {ev.station_id}:")
+                    print(f"  Requested energy: {ev.requested_energy:.3f} kWh")
+                    print(f"  Delivered energy: {ev.delivered_energy:.3f} kWh")
+                    print(f"  Arrival SOC: {ev.arrival_soc:.1%}")
+                    print(f"  Current SOC: {ev.current_soc:.1%}")
+                    print(f"  Target SOC: {ev.target_soc:.1%}")
 
         print(f"\nREWARD: {reward}")
-        print(f"TERMINATED: {terminated}")
     
     if terminated:
         print("\n=== EPISODE TERMINATED EARLY ===")
