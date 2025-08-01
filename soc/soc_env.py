@@ -236,11 +236,16 @@ class EVChargingEnv(Env):
             projected_action: array of shape [num_stations], still a normalized
                 charging rate in [0, 1]
         """
+        filtered_demands = np.where(self._est_departures > 0, self._demands, 0)
+
         self._projected_action.value = action  # initialize value for faster convergence
         self._agent_action.value = action
-        self._demands_cvx.value = self._demands
+        self._demands_cvx.value = filtered_demands
         solve_mosek(self.prob, self.verbose)
         action = self._projected_action.value
+
+        action = np.where(self._est_departures > 0, action, 0)
+
         return action
 
     def __repr__(self) -> str:
@@ -384,8 +389,16 @@ class EVChargingEnv(Env):
             pilot_signals: mapping of station ids to a single-element list of
                 pilot signals in Amps
         """
+
+        # Set action to 0 for any EVs that have departed (departure time <= 0)
+        for station_idx in range(self.num_stations):
+            if self._est_departures[station_idx] <= 0:  # If departure time has passed
+                action[station_idx] = 0  # Set charging action to 0
+
+
         if self.project_action_in_env:
             action = self._project_action(action)
+
 
         action *= self.ACTION_SCALE_FACTOR  # convert to (A), in [0, 32]
         pilot_signals = {}
