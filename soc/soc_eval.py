@@ -80,6 +80,15 @@ print("\n=== Environment Reset ===\n")
 
 # Assuming 5-minute timesteps (as is common in EV charging simulations)
 timestep_minutes = 5
+total_rewards = 0
+
+# Store previous cumulative reward breakdown
+prev_reward_breakdown = {
+    'profit': 0.0,
+    'carbon_cost': 0.0,
+    'excess_charge': 0.0
+}
+
 
 # === Run the evaluation ===
 for timestep in range(288):
@@ -90,6 +99,20 @@ for timestep in range(288):
     # Predict action using the trained model
     action, _ = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = env.step(action)
+    reward_breakdown = info['reward_breakdown']
+    total_rewards += reward
+
+    # Compute per-step reward components
+    current_reward_breakdown = info['reward_breakdown']
+    step_profit = current_reward_breakdown['profit'] - prev_reward_breakdown['profit']
+    step_carbon_cost = current_reward_breakdown['carbon_cost'] - prev_reward_breakdown['carbon_cost']
+    step_excess_charge = current_reward_breakdown['excess_charge'] - prev_reward_breakdown['excess_charge']
+
+    # === max possible reward per step ===
+    num_active_evs = len(env._simulator.get_active_evs()) # Number of EVs charging this step
+    max_profit_step = num_active_evs * 32 * env.PROFIT_FACTOR
+    min_carbon_cost_step = num_active_evs * 32 * env.CARBON_COST_FACTOR * env.moer[env.t, 0]
+    max_reward_step = max_profit_step - min_carbon_cost_step
 
     # Calculate delivered energy (kWh) per charger
     energy_delivered_per_charger = action * charger_max  # action is [0-1], charger_max is in kWh
@@ -150,9 +173,25 @@ for timestep in range(288):
         
         # Print reward information
         print(f"\nREWARD: {reward}")
+
+        # Print per-step reward breakdown
+        print(f"\nTimestep {env.t}:")
+        print(f"  Step reward: {reward:.2f} (Max possible: {max_reward_step:.2f})")
+        print(f"  Step profit: ${step_profit:.2f}")
+        print(f"  Step carbon cost: ${step_carbon_cost:.2f}")
+        print(f"  Step violation cost: ${step_excess_charge:.2f}")
+
+        # Update previous reward breakdown for next step
+        prev_reward_breakdown = current_reward_breakdown.copy()
     
     if terminated:
         print("\n=== EPISODE TERMINATED EARLY ===")
+        print("Episode finished")
+        print(f"Total reward: {total_rewards}")
+        print(f"Profit: ${info['reward_breakdown']['profit']:.2f}")
+        print(f"Carbon cost: ${info['reward_breakdown']['carbon_cost']:.2f}")
+        print(f"Grid violation cost: ${info['reward_breakdown']['excess_charge']:.2f}")
+        print(f"Maximum possible profit: ${info['max_profit']:.2f}")
         break
 
 print("\n=== SIMULATION COMPLETE ===")
