@@ -133,24 +133,21 @@ for timestep in range(288):
         # Create header for the table
         header = [
             "Station", "Action", "Energy (kWh)", "Remaining (kWh)", 
-            "Demand (kWh)", "Est Depart", "Arrival SOC", 
-            "Current SOC", "Target SOC"
+            "Demand (kWh)", "Est Depart", "Current SOC"
         ]
-        
+
         # Format the header
         print(
             f"{header[0]:<8} {header[1]:<7} {header[2]:<12} {header[3]:<12} "
-            f"{header[4]:<12} {header[5]:<10} {header[6]:<12} "
-            f"{header[7]:<12} {header[8]:<12}"
+            f"{header[4]:<12} {header[5]:<10} {header[6]:<12}"
         )
         print("-" * 100)
-        
+
         # Populate the table rows
         for station_idx in demand_stations:
             energy = energy_delivered_per_charger[station_idx]
             remaining = obs['demands'][station_idx] - energy
             est_depart = obs['est_departures'][station_idx]
-            
             
             print(
                 f"{station_idx:<8} "
@@ -159,9 +156,7 @@ for timestep in range(288):
                 f"{remaining:<12.3f} "
                 f"{obs['demands'][station_idx]:<12.3f} "
                 f"{obs['est_departures'][station_idx]:<10}"
-                f"{obs['arrival_soc'][station_idx]:<12.1%} "
-                f"{obs['current_soc'][station_idx]:<12.1%} "
-                f"{obs['target_soc'][station_idx]:<12.1%}"
+                f"{obs['soc'][station_idx]:<12.1%}"
             )
         
         # Calculate and print utilization statistics
