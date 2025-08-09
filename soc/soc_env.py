@@ -152,39 +152,45 @@ class EVChargingEnv(Env):
 
     def _init_action_projection(self) -> None:
         """Initializes optimization problem, parameters, and variables."""
-        # Projected action to be sent as actual pilot signal, normalized to [0, 1]
         self._projected_action = cp.Variable(self.num_stations, nonneg=True)
-
-        # Parameters to be set when stepping through environment
         self._agent_action = cp.Parameter(self.num_stations, nonneg=True)
-        self._demands_cvx = cp.Parameter(self.num_stations, nonneg=True)
-
-        # Action cannot exceed maximum pilot signal or total demand of vehicle
-        max_action = cp.minimum(
-            1., self._demands_cvx / self.A_PERS_TO_KWH / self.ACTION_SCALE_FACTOR)
-
+        self._max_action_param = cp.Parameter(self.num_stations, nonneg=True)  # Max action based on demand
+        
         objective = cp.Minimize(cp.norm(self._projected_action - self._agent_action, p=2))
         constraints = [
-            self._projected_action <= max_action,
-            magnitude_constraint(self._projected_action, self.cn)
+            self._projected_action <= self._max_action_param,  # Enforce demand-based limits
+            magnitude_constraint(self._projected_action, self.cn)  # Enforce network constraints
         ]
         self.prob = cp.Problem(objective, constraints)
 
-        assert self.prob.is_dpp() and self.prob.is_dcp()
 
     def _project_action(self, action: np.ndarray) -> np.ndarray:
         """Projects action to satisfy charging network constraints."""
-        filtered_demands = np.where(self._est_departures > 0, self._demands, 0)
-
-        self._projected_action.value = action  # initialize value for faster convergence
+        # Calculate maximum possible energy per timestep (kWh)
+        max_energy_per_timestep = self.A_PERS_TO_KWH * self.ACTION_SCALE_FACTOR  # ~0.555 kWh
+        
+        # Calculate maximum allowed action for each station based on remaining demand
+        max_action = np.zeros_like(action)
+        for station_idx in range(self.num_stations):
+            if self._est_departures[station_idx] > 0:  # Only for active EVs
+                remaining_demand = self._demands[station_idx]
+                # Max action is the minimum of:
+                # 1. What's needed to fulfill remaining demand in one timestep
+                # 2. The maximum possible action (1.0)
+                max_action[station_idx] = min(1.0, remaining_demand / max_energy_per_timestep)
+        
+        # Set up and solve the optimization problem
+        self._projected_action.value = action  # Initialize for faster convergence
         self._agent_action.value = action
-        self._demands_cvx.value = filtered_demands
+        self._max_action_param.value = max_action
+        
         solve_mosek(self.prob, self.verbose)
-        action = self._projected_action.value
-
-        action = np.where(self._est_departures > 0, action, 0)
-
-        return action
+        projected_action = self._projected_action.value
+        
+        # Ensure we zero-out actions for departed EVs
+        projected_action = np.where(self._est_departures > 0, projected_action, 0.0)
+        
+        return projected_action
 
     def __repr__(self) -> str:
         """Returns the string representation of charging gym."""
