@@ -93,8 +93,15 @@ prev_reward_breakdown = {
 # === Run the evaluation ===
 for timestep in range(288):
     # Calculate energy values (kWh per timestep)
-    charger_max = get_theoretical_max_energy(timestep_minutes)
+    charger_max_energy = get_theoretical_max_energy(timestep_minutes)  # 0.555 kWh for 5-min timestep
     total_available = get_total_available_energy(env.cn, timestep_minutes)
+    
+    # Calculate max possible action based on demand
+    max_action_demand = np.where(
+        obs['est_departures'] > 0,
+        np.minimum(1.0, obs['demands'] / charger_max_energy),
+        0.0
+    )
     
     # Predict action using the trained model
     action, _ = model.predict(obs, deterministic=True)
@@ -108,14 +115,9 @@ for timestep in range(288):
     step_carbon_cost = current_reward_breakdown['carbon_cost'] - prev_reward_breakdown['carbon_cost']
     step_excess_charge = current_reward_breakdown['excess_charge'] - prev_reward_breakdown['excess_charge']
 
-    # === max possible reward per step ===
-    num_active_evs = len(env._simulator.get_active_evs()) # Number of EVs charging this step
-    max_profit_step = num_active_evs * 32 * env.PROFIT_FACTOR
-    min_carbon_cost_step = num_active_evs * 32 * env.CARBON_COST_FACTOR * env.moer[env.t, 0]
-    max_reward_step = max_profit_step - min_carbon_cost_step
-
     # Calculate delivered energy (kWh) per charger
-    energy_delivered_per_charger = action * charger_max  # action is [0-1], charger_max is in kWh
+    energy_delivered_per_charger = action * charger_max_energy
+    max_energy_by_demand = max_action_demand * charger_max_energy
     
     # Print energy delivered information
     if 'demands' in obs and np.any(obs['demands'] > 0):
@@ -123,7 +125,7 @@ for timestep in range(288):
         
         # Print energy information
         print(f"\n--- ENERGY INFORMATION (kWh) ---")
-        print(f"Maximum possible per charger per timestep: {charger_max:.3f} kWh")
+        print(f"Maximum possible per charger per timestep: {charger_max_energy:.3f} kWh")
         print(f"Total available from grid per timestep: {total_available:.3f} kWh")
         
         # Print detailed energy allocation per charger with SOC information
@@ -132,27 +134,30 @@ for timestep in range(288):
         
         # Create header for the table
         header = [
-            "Station", "Action", "Energy (kWh)", "Remaining (kWh)", 
-            "Demand (kWh)", "Est Depart", "Current SOC"
+            "Station", "Action", "Max Action", "Energy (kWh)", "Max by Demand", 
+            "Remaining (kWh)", "Demand (kWh)", "Est Depart", "Current SOC"
         ]
 
         # Format the header
         print(
-            f"{header[0]:<8} {header[1]:<7} {header[2]:<12} {header[3]:<12} "
-            f"{header[4]:<12} {header[5]:<10} {header[6]:<12}"
+            f"{header[0]:<8} {header[1]:<7} {header[2]:<10} {header[3]:<12} "
+            f"{header[4]:<12} {header[5]:<12} {header[6]:<12} {header[7]:<10} {header[8]:<12}"
         )
-        print("-" * 100)
+        print("-" * 120)
 
         # Populate the table rows
         for station_idx in demand_stations:
             energy = energy_delivered_per_charger[station_idx]
+            max_energy = max_energy_by_demand[station_idx]
             remaining = obs['demands'][station_idx] - energy
             est_depart = obs['est_departures'][station_idx]
             
             print(
                 f"{station_idx:<8} "
                 f"{action[station_idx]:<7.3f} "
+                f"{max_action_demand[station_idx]:<10.3f} "
                 f"{energy:<12.3f} "
+                f"{max_energy:<12.3f} "
                 f"{remaining:<12.3f} "
                 f"{obs['demands'][station_idx]:<12.3f} "
                 f"{obs['est_departures'][station_idx]:<10}"
@@ -161,17 +166,21 @@ for timestep in range(288):
         
         # Calculate and print utilization statistics
         total_allocated = np.sum(energy_delivered_per_charger[demand_stations])
-        avg_utilization = np.mean(energy_delivered_per_charger[demand_stations] / charger_max)
-        print(f"\nTotal allocated to EVs: {total_allocated:.3f} kWh")
+        total_max_possible = np.sum(max_energy_by_demand[demand_stations])
+        avg_utilization = np.mean(energy_delivered_per_charger[demand_stations] / charger_max_energy)
+        demand_utilization = np.mean(energy_delivered_per_charger[demand_stations] / max_energy_by_demand[demand_stations])
+        
+        print(f"\nTotal allocated to EVs: {total_allocated:.3f} kWh (of {total_max_possible:.3f} kWh possible based on demand)")
         print(f"Grid utilization: {total_allocated/total_available:.1%}")
         print(f"Average charger utilization: {avg_utilization:.1%}")
+        print(f"Average demand utilization: {demand_utilization:.1%}")
         
         # Print reward information
         print(f"\nREWARD: {reward}")
 
         # Print per-step reward breakdown
         print(f"\nTimestep {env.t}:")
-        print(f"  Step reward: {reward:.2f} (Max possible: {max_reward_step:.2f})")
+        print(f"  Step reward: {reward:.2f}")
         print(f"  Step profit: ${step_profit:.2f}")
         print(f"  Step carbon cost: ${step_carbon_cost:.2f}")
         print(f"  Step violation cost: ${step_excess_charge:.2f}")
