@@ -86,9 +86,9 @@ total_rewards = 0
 prev_reward_breakdown = {
     'profit': 0.0,
     'carbon_cost': 0.0,
-    'excess_charge': 0.0
+    'excess_charge': 0.0,
+    'demand_penalty': 0.0,
 }
-
 
 # === Run the evaluation ===
 for timestep in range(288):
@@ -106,7 +106,6 @@ for timestep in range(288):
     # Predict action using the trained model
     action, _ = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = env.step(action)
-    reward_breakdown = info['reward_breakdown']
     total_rewards += reward
 
     # Compute per-step reward components
@@ -114,6 +113,7 @@ for timestep in range(288):
     step_profit = current_reward_breakdown['profit'] - prev_reward_breakdown['profit']
     step_carbon_cost = current_reward_breakdown['carbon_cost'] - prev_reward_breakdown['carbon_cost']
     step_excess_charge = current_reward_breakdown['excess_charge'] - prev_reward_breakdown['excess_charge']
+    step_demand_penalty = current_reward_breakdown.get('demand_penalty', 0) - prev_reward_breakdown.get('demand_penalty', 0)
 
     # Calculate delivered energy (kWh) per charger
     energy_delivered_per_charger = action * charger_max_energy
@@ -134,8 +134,8 @@ for timestep in range(288):
         
         # Create header for the table
         header = [
-            "Station", "Action", "Max Action", "Energy (kWh)", "Max by Demand", 
-            "Remaining (kWh)", "Demand (kWh)", "Est Depart", "Current SOC"
+            "Station", "Action", "MaxAction", "Energy(kWh)", "MaxByDemand", 
+            "Remaining(kWh)", "Demand(kWh)", "EstDepart", "CurrentSOC"
         ]
 
         # Format the header
@@ -161,7 +161,7 @@ for timestep in range(288):
                 f"{remaining:<12.3f} "
                 f"{obs['demands'][station_idx]:<12.3f} "
                 f"{obs['est_departures'][station_idx]:<10}"
-                f"{obs['soc'][station_idx]:<12.1%}"
+                f"{obs['current_soc'][station_idx]:<12.1%}"
             )
         
         # Calculate and print utilization statistics
@@ -176,7 +176,7 @@ for timestep in range(288):
         print(f"Average demand utilization: {demand_utilization:.1%}")
         
         # Print reward information
-        print(f"\nREWARD: {reward}")
+        print(f"\nREWARD: {reward:.2f}")
 
         # Print per-step reward breakdown
         print(f"\nTimestep {env.t}:")
@@ -184,17 +184,42 @@ for timestep in range(288):
         print(f"  Step profit: ${step_profit:.2f}")
         print(f"  Step carbon cost: ${step_carbon_cost:.2f}")
         print(f"  Step violation cost: ${step_excess_charge:.2f}")
+        print(f"  Demand penalty: ${step_demand_penalty:.8f} (over/under charging)")
 
         # Update previous reward breakdown for next step
         prev_reward_breakdown = current_reward_breakdown.copy()
+
+
+        # In your evaluation loop, after getting the reward breakdown:
+        print("\n--- DEMAND PENALTY ANALYSIS ---")
+        for session_info in env._interface.active_sessions():
+            station_idx = env._evse_name_to_idx[session_info.station_id]
+            
+            # Skip if EV has departed (timestep <= 0)
+            if obs['est_departures'][station_idx] <= 0:
+                continue
+                
+            remaining_demand = session_info.remaining_demand
+            delivered = action[station_idx] * charger_max_energy
+            max_possible = min(charger_max_energy, remaining_demand)
+            
+            if delivered > max_possible:
+                over = delivered - max_possible
+                penalty = over * env.OVER_CHARGE_PENALTY_FACTOR
+                print(f"Station {station_idx}: OVER-charged by {over:.3f}kWh (penalty ${penalty:.2f})")
+            elif delivered < max_possible:
+                under = max_possible - delivered
+                penalty = under * env.UNDER_CHARGE_PENALTY_FACTOR
+                print(f"Station {station_idx}: UNDER-charged by {under:.3f}kWh (penalty ${penalty:.2f})")
     
     if terminated:
         print("\n=== EPISODE TERMINATED EARLY ===")
         print("Episode finished")
-        print(f"Total reward: {total_rewards}")
+        print(f"Total reward: {total_rewards:.2f}")
         print(f"Profit: ${info['reward_breakdown']['profit']:.2f}")
         print(f"Carbon cost: ${info['reward_breakdown']['carbon_cost']:.2f}")
         print(f"Grid violation cost: ${info['reward_breakdown']['excess_charge']:.2f}")
+        print(f"Demand penalty: ${info['reward_breakdown']['demand_penalty']:.2f}")  # now total for episode
         print(f"Maximum possible profit: ${info['max_profit']:.2f}")
         break
 
