@@ -15,6 +15,7 @@ from acnportal.acnsim.models.battery import Linear2StageBattery
 import cvxpy as cp
 from gymnasium import Env, spaces
 import numpy as np
+import pprint
 
 from .event_generation import AbstractTraceGenerator
 from .utils import MINS_IN_DAY, site_str_to_site
@@ -77,6 +78,9 @@ class EVChargingEnv(Env):
     VIOLATION_FACTOR = A_PERS_TO_KWH * VIOLATION_WEIGHT  # $ / (A * period)
     CARBON_COST_FACTOR = A_PERS_TO_KWH * (CO2_COST_PER_METRIC_TON / 1000)  # ($ * kV * hr) / (kg CO2 * period)
 
+    OVER_CHARGE_PENALTY_FACTOR = A_PERS_TO_KWH * MARGINAL_PROFIT_PER_KWH * 40 # 2x profit factor for over-charging
+    UNDER_CHARGE_PENALTY_FACTOR = A_PERS_TO_KWH * MARGINAL_PROFIT_PER_KWH * 30  # 1.5x for under-charging
+
     def __init__(self, data_generator: AbstractTraceGenerator,
                  moer_forecast_steps: int = 36,
                  project_action_in_env: bool = True,
@@ -98,8 +102,10 @@ class EVChargingEnv(Env):
         self.num_stations = len(self.cn.station_ids)
         self._evse_name_to_idx = {evse: i for i, evse in enumerate(self.cn.station_ids)}
         
-        # Initialize battery models for each station (will be populated when EVs arrive)
-        self._batteries = [None] * self.num_stations
+        self._arrival_soc = np.zeros(self.num_stations, dtype=np.float32)  # SOC upon arrival (0-1)
+        self._target_soc = np.zeros(self.num_stations, dtype=np.float32)   # Target SOC (0-1)
+        self._current_soc = np.zeros(self.num_stations, dtype=np.float32) # Current SOC (0-1)
+
 
         # Initialize observation arrays
         self._est_departures = np.zeros(self.num_stations, dtype=np.float32)
@@ -116,7 +122,10 @@ class EVChargingEnv(Env):
                                         shape=(self.num_stations,), dtype=np.float32),
             'prev_moer':       spaces.Box(0, 1, shape=(1,), dtype=np.float32),
             'forecasted_moer': spaces.Box(0, 1, shape=(self.moer_forecast_steps,), dtype=np.float32),
-            'soc':             spaces.Box(0, 1, shape=(self.num_stations,), dtype=np.float32),
+            'arrival_soc':     spaces.Box(0, 1, shape=(self.num_stations,), dtype=np.float32),
+            'target_soc':      spaces.Box(0, 1, shape=(self.num_stations,), dtype=np.float32),
+            'current_soc':     spaces.Box(0, 1, shape=(self.num_stations,), dtype=np.float32),
+
         })
 
         self._obs = {
@@ -125,7 +134,9 @@ class EVChargingEnv(Env):
             'demands': self._demands,
             'prev_moer': self._prev_moer,
             'forecasted_moer': self._forecasted_moer,
-            'soc': self._soc,
+            'arrival_soc': self._arrival_soc,
+            'target_soc': self._target_soc,
+            'current_soc': self._current_soc,
         }
 
         # Track cumulative components of reward signal
@@ -133,6 +144,7 @@ class EVChargingEnv(Env):
             'profit': 0.0,
             'carbon_cost': 0.0,
             'excess_charge': 0.0,
+            'demand_penalty': 0.0,
         }
 
         # Initialize variables for gym resetting
@@ -204,6 +216,7 @@ class EVChargingEnv(Env):
 
         # Convert action to schedule
         schedule = self._to_schedule(action)
+
         
         # Update battery states before stepping simulator
         for station_id, pilot in schedule.items():
@@ -286,44 +299,41 @@ class EVChargingEnv(Env):
         """Returns observations for the current state of simulation."""
         self._est_departures.fill(0)
         self._demands.fill(0)
-        self._soc.fill(0)
+        self._arrival_soc.fill(0)
+        self._target_soc.fill(0)
+        self._current_soc.fill(0)
+
 
         for session_info in self._interface.active_sessions():
             station_idx = self._evse_name_to_idx[session_info.station_id]
-            
+
             # Get EV object
             ev = next((ev for ev in self._simulator.get_active_evs() 
-                     if ev.station_id == session_info.station_id), None)
+                    if ev.station_id == session_info.station_id), None)
             
             if ev:
-                # Initialize battery model if not already done
-                if self._batteries[station_idx] is None:
-                    capacity = ev.requested_energy
-                    max_power = 32 * self.VOLTAGE / 1000  # Max charging power in kW (32A * 208V)
-                    self._batteries[station_idx] = Linear2StageBattery(
-                        capacity=capacity,
-                        init_charge=0,  # Start with empty battery
-                        max_power=max_power,
-                        transition_soc=0.8  # Standard transition point
-                    )
+                # Since ACN-Sim's EV model doesn't provide battery capacity directly,
+                # we'll use requested_energy as the reference for SOC calculations
                 
-                # Update SOC based on charging progress
-                remaining_energy = ev.requested_energy * ev.percent_remaining
-                delivered_energy = ev.requested_energy - remaining_energy
+                # Arrival SOC: Since we don't know the actual battery capacity,
+                # we'll assume the EV arrived with just enough charge to need requested_energy
+                # This means arrival SOC is effectively 0% (needs full requested_energy)
+                self._arrival_soc[station_idx] = 0.0
                 
-                # Calculate current SOC (0-1)
-                if ev.requested_energy > 0:
-                    self._soc[station_idx] = delivered_energy / ev.requested_energy
-                else:
-                    self._soc[station_idx] = 0.0
+                # Target SOC: Always 100% (1.0) since requested_energy represents full charge needed
+                self._target_soc[station_idx] = 1.0
                 
-                # Update demands
-                self._demands[station_idx] = remaining_energy
+                # Current SOC: Percentage of requested energy that has been delivered
+                # This is equivalent to (requested_energy - remaining_demand)/requested_energy
+                # Which is exactly (1 - percent_remaining) from the EV model
+                self._current_soc[station_idx] = 1.0 - ev.percent_remaining
+
 
             self._est_departures[station_idx] = session_info.estimated_departure - self.t
+            self._demands[station_idx] = session_info.remaining_demand  # kWh
 
         self._prev_moer[0] = self.moer[self.t, 0]
-        self._forecasted_moer[:] = self.moer[self.t, 1:self.moer_forecast_steps + 1]
+        self._forecasted_moer[:] = self.moer[self.t, 1:self.moer_forecast_steps + 1]  # forecasts start from 2nd column
         self._timestep_obs[0] = self.t / self.max_timestep
 
         return self._obs
@@ -361,26 +371,73 @@ class EVChargingEnv(Env):
         return max_profit
 
     def _get_reward(self, schedule: Mapping[str, Sequence[float]]) -> float:
-        """Returns total reward for scheduler performance on current timestep."""
-        # profit calculation (Amp * period) -> ($)
-        total_charging_rate = np.sum(self._simulator.charging_rates[:, self.t-1])  # in (A)
+        """
+        Returns total reward for scheduler performance on current timestep.
+
+        Components:
+        1. Profit from charging
+        2. Penalty for violating network constraints
+        3. Carbon cost based on current MOER
+        4. Per-EV penalties for:
+            - Over-charging (delivered > max possible based on demand)
+            - Under-charging (delivered < max possible based on demand)
+        """
+
+        # Get current charging rates (in Amps)
+        current_charging_rates = self._simulator.charging_rates[:, self.t - 1]
+        total_charging_rate = np.sum(current_charging_rates)
+
+        # Delivered energy (kWh) for each station this timestep
+        delivered_energy_per_station = current_charging_rates * self.A_PERS_TO_KWH
+
+        # Calculate max possible energy for each station based on remaining demand
+        charger_max_energy = (
+            self.ACTION_SCALE_FACTOR * self.VOLTAGE / 1000
+        ) * (self.TIMESTEP_DURATION / 60)
+
+        step_demand_penalty = 0.0
+        for session_info in self._interface.active_sessions():
+            station_idx = self._evse_name_to_idx[session_info.station_id]
+            remaining_demand = session_info.remaining_demand
+
+            # Max this EV can take this timestep
+            max_possible = min(charger_max_energy, remaining_demand)
+            delivered = delivered_energy_per_station[station_idx]
+            diff = delivered - max_possible
+
+            if diff > 0:
+                # Over-charging penalty
+                step_demand_penalty += diff * self.OVER_CHARGE_PENALTY_FACTOR
+            elif diff < 0:
+                # Under-charging penalty
+                step_demand_penalty += -diff * self.UNDER_CHARGE_PENALTY_FACTOR
+
+        # Profit ($)
         profit = self.PROFIT_FACTOR * total_charging_rate
 
-        # Network constraints - amount of charge over maximum allowed rates ($)
-        schedule = np.array([x[0] for x in schedule.values()])  # convert to numpy
-        current_sum = np.abs(self._simulator.network.constraint_current(schedule))
-        excess_current = np.sum(np.maximum(0, current_sum - self._simulator.network.magnitudes))
-        excess_charge = excess_current * self.VIOLATION_FACTOR
+        # Network constraint penalty ($)
+        schedule_array = np.array([x[0] for x in schedule.values()])
+        current_sum = np.abs(self._simulator.network.constraint_current(schedule_array))
+        excess_current = np.sum(
+            np.maximum(0, current_sum - self._simulator.network.magnitudes)
+        )
+        excess_charge_penalty = excess_current * self.VIOLATION_FACTOR
 
-        # Carbon cost (Amp * period * kg CO2 / kWh) -> ($)
-        carbon_cost = self.CARBON_COST_FACTOR * total_charging_rate * self.moer[self.t, 0]
+        # Carbon cost ($)
+        carbon_cost = (
+            self.CARBON_COST_FACTOR * total_charging_rate * self.moer[self.t, 0]
+        )
 
-        total_reward = profit - carbon_cost - excess_charge
+        # Total reward
+        total_reward = (
+            profit - carbon_cost - excess_charge_penalty - step_demand_penalty
+        )
 
-        # Update reward information-tracking
-        self._reward_breakdown['profit'] += profit
-        self._reward_breakdown['carbon_cost'] += carbon_cost
-        self._reward_breakdown['excess_charge'] += excess_charge
+        # Update cumulative tracking
+        self._reward_breakdown["profit"] += profit
+        self._reward_breakdown["carbon_cost"] += carbon_cost
+        self._reward_breakdown["excess_charge"] += excess_charge_penalty
+        self._reward_breakdown["demand_penalty"] += step_demand_penalty  # cumulative
 
         return total_reward
 
@@ -409,3 +466,13 @@ def magnitude_constraint(action: cp.Variable, cn: acns.ChargingNetwork
         raise ValueError(
             'Action should have shape [num_stations] or [num_stations, T], '
             f'but received shape {action.shape} instead.')
+    
+def compute_max_energy_by_demand(self, obs, timestep_minutes=5):
+    charger_max_energy = (self.ACTION_SCALE_FACTOR * self.VOLTAGE / 1000) * (timestep_minutes / 60)
+    max_action_demand = np.where(
+        obs['est_departures'] > 0,
+        np.minimum(1.0, obs['demands'] / charger_max_energy),
+        0.0
+    )
+    max_energy_by_demand = max_action_demand * charger_max_energy
+    return max_energy_by_demand
