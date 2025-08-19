@@ -142,6 +142,8 @@ class EVChargingEnv(Env):
         # --- Track projected actions ---
         self._last_projection = np.zeros(self.num_stations, dtype=np.float32)
 
+        self._current_reward_breakdown = {}  # Track per-timestep rewards
+
         # SOC arrays
         self._arrival_soc = np.zeros(self.num_stations, dtype=np.float32)
         self._target_soc = np.zeros(self.num_stations, dtype=np.float32)
@@ -483,7 +485,8 @@ class EVChargingEnv(Env):
         """
         info = {
             'max_profit': self._max_profit,
-            'reward_breakdown': self._reward_breakdown
+            'reward_breakdown': self._reward_breakdown,
+            'current_reward_breakdown': self._current_reward_breakdown, # Per-timestep
         }
         if all:
             info.update({
@@ -549,6 +552,16 @@ class EVChargingEnv(Env):
 
         # Total reward
         total_reward = profit - carbon_cost - excess_charge + follow_projection_reward
+
+        # --- Store per-timestep reward breakdown (NEW) ---
+        self._current_reward_breakdown = {
+            'profit': profit,
+            'carbon_cost': carbon_cost,
+            'excess_charge': excess_charge,
+            'follow_projection': follow_projection_reward,
+            'total': total_reward
+        }
+
 
         # Update reward breakdown
         self._reward_breakdown['profit'] += profit
