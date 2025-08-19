@@ -102,7 +102,17 @@ for timestep in range(288):
     # Now actually step the env with the agent's raw action (env will project again internally)
     obs, reward, terminated, truncated, info = env.step(agent_action)
 
-
+    # Get per-timestep reward breakdown
+    current_reward = info['current_reward_breakdown']
+    
+    # Print reward breakdown for every timestep (even if no demand)
+    print(f"\n--- TIMESTEP {timestep} REWARD BREAKDOWN ---")
+    print(f"Total Reward: {current_reward['total']:.4f}")
+    print(f"Profit: {current_reward['profit']:.4f}")
+    print(f"Carbon Cost: {-current_reward['carbon_cost']:.4f}")
+    print(f"Excess Charge Penalty: {-current_reward['excess_charge']:.4f}")
+    if 'follow_projection' in current_reward:
+        print(f"Projection Following: {current_reward['follow_projection']:.4f}")
 
     # Print details only when there is demand at any station
     if 'demands' in obs and np.any(obs['demands'] > 0):
